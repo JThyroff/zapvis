@@ -3,11 +3,14 @@ use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
-use image::GenericImageView;
+use image::{GenericImageView, RgbaImage};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
 
 /// zapvis: sequence-only image viewer.
 /// Opens a file, matches it against configured patterns with # as digit placeholders,
@@ -250,11 +253,114 @@ fn pick_sequence(cfg: &Config, input: &Path) -> Result<(String, SequenceSpec)> {
 
 // ---------------- GUI app ----------------
 
+/// Bidirectional image cache with configurable radius.
+/// Maintains textures for indices in range [current - radius, current + radius].
+/// Uses background threads for image decoding to prevent UI freezing.
+struct ImageCache {
+    cache: BTreeMap<u64, TextureHandle>,
+    cache_radius: usize,
+    pending_loads: HashSet<u64>,
+    tx: Sender<(u64, RgbaImage)>,
+    rx: Receiver<(u64, RgbaImage)>,
+}
+
+impl ImageCache {
+    fn new(cache_radius: usize) -> Self {
+        let (tx, rx) = channel();
+        Self {
+            cache: BTreeMap::new(),
+            cache_radius,
+            pending_loads: HashSet::new(),
+            tx,
+            rx,
+        }
+    }
+
+    /// Get texture for specific index if cached
+    fn get(&self, idx: u64) -> Option<&TextureHandle> {
+        self.cache.get(&idx)
+    }
+
+    /// Process any decoded images from background threads (convert to textures)
+    fn process_decoded_images(&mut self, ctx: &egui::Context) -> usize {
+        let mut converted = 0;
+        // Process all available decoded images (non-blocking)
+        while let Ok((idx, rgba_image)) = self.rx.try_recv() {
+            self.pending_loads.remove(&idx);
+            if let Ok(tex) = rgba_to_texture(ctx, rgba_image) {
+                self.cache.insert(idx, tex);
+                converted += 1;
+            }
+        }
+        converted
+    }
+
+    /// Update cache centered on new_index, preloading neighbors and evicting out-of-range entries
+    fn update_for_index(
+        &mut self,
+        new_index: u64,
+        seq: &SequenceSpec,
+        ctx: &egui::Context,
+    ) -> (usize, usize) {
+        // First, process any decoded images waiting to become textures
+        self.process_decoded_images(ctx);
+
+        let radius = self.cache_radius as u64;
+        let min_idx = new_index.saturating_sub(radius);
+        let max_idx = new_index.saturating_add(radius);
+
+        // Evict entries outside the desired range
+        let to_evict: Vec<u64> = self
+            .cache
+            .keys()
+            .filter(|&&idx| idx < min_idx || idx > max_idx)
+            .copied()
+            .collect();
+        
+        let evicted_count = to_evict.len();
+        for idx in to_evict {
+            self.cache.remove(&idx);
+        }
+
+        // Cancel pending loads outside range
+        self.pending_loads.retain(|&idx| idx >= min_idx && idx <= max_idx);
+
+        // Launch background loads for missing entries in range
+        let mut launched_count = 0;
+        for idx in min_idx..=max_idx {
+            if !self.cache.contains_key(&idx) && !self.pending_loads.contains(&idx) {
+                let path = seq.path_for(idx);
+                if path.exists() {
+                    self.pending_loads.insert(idx);
+                    let tx = self.tx.clone();
+                    let path_clone = path.clone();
+                    thread::spawn(move || {
+                        if let Ok(rgba) = load_image_rgba(&path_clone) {
+                            let _ = tx.send((idx, rgba));
+                        }
+                    });
+                    launched_count += 1;
+                }
+            }
+        }
+
+        (launched_count, evicted_count)
+    }
+
+    /// Process any newly decoded images on each frame
+    fn tick(&mut self, ctx: &egui::Context) {
+        self.process_decoded_images(ctx);
+    }
+
+    fn cache_info(&self) -> String {
+        format!("Cache: {} loaded, {} pending", self.cache.len(), self.pending_loads.len())
+    }
+}
+
 struct ZapVisApp {
     pattern: String,
     seq: SequenceSpec,
-
-    texture: Option<TextureHandle>,
+    cache: ImageCache,
     status: String,
 }
 
@@ -263,22 +369,31 @@ impl ZapVisApp {
         Self {
             pattern,
             seq,
-            texture: None,
+            cache: ImageCache::new(10), // Default: 10 images before/after (21 total)
             status: String::new(),
         }
     }
 
-    fn load_current(&mut self, ctx: &egui::Context) {
+    fn update_cache_and_status(&mut self, ctx: &egui::Context) {
+        let (loaded, evicted) = self.cache.update_for_index(self.seq.index, &self.seq, ctx);
+        
         let path = self.seq.path_for(self.seq.index);
-        match load_image_to_texture(ctx, &path) {
-            Ok(tex) => {
-                self.texture = Some(tex);
-                self.status = format!("{}  (pattern: {})", path.display(), self.pattern);
-            }
-            Err(e) => {
-                self.texture = None;
-                self.status = format!("Failed to load {}: {e}", path.display());
-            }
+        if self.cache.get(self.seq.index).is_some() {
+            self.status = format!(
+                "{}  (pattern: {})  |  {} | +{} -{}",
+                path.display(),
+                self.pattern,
+                self.cache.cache_info(),
+                loaded,
+                evicted
+            );
+        } else {
+            self.status = format!("Failed to load {} | {} | +{} -{}", 
+                path.display(), 
+                self.cache.cache_info(), 
+                loaded, 
+                evicted
+            );
         }
     }
 
@@ -292,19 +407,22 @@ impl ZapVisApp {
         let p = self.seq.path_for(next_u);
         if p.exists() {
             self.seq.index = next_u;
-            self.load_current(ctx);
+            self.update_cache_and_status(ctx);
         } else {
             // strict: don't scan; just stop
-            self.status = format!("No file: {}", p.display());
+            self.status = format!("No file: {} | {}", p.display(), self.cache.cache_info());
         }
     }
 }
 
 impl eframe::App for ZapVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Load initial image once
-        if self.texture.is_none() && self.status.is_empty() {
-            self.load_current(ctx);
+        // Process any decoded images from background threads
+        self.cache.tick(ctx);
+
+        // Load initial cache once
+        if self.cache.cache.is_empty() && self.status.is_empty() {
+            self.update_cache_and_status(ctx);
         }
 
         // Keyboard navigation
@@ -322,7 +440,7 @@ impl eframe::App for ZapVisApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(tex) = &self.texture {
+            if let Some(tex) = self.cache.get(self.seq.index) {
                 let avail = ui.available_size();
 
                 let tex_size = tex.size_vec2();
@@ -342,12 +460,17 @@ impl eframe::App for ZapVisApp {
     }
 }
 
-fn load_image_to_texture(ctx: &egui::Context, path: &Path) -> Result<TextureHandle> {
-    let img = image::open(path).with_context(|| format!("image::open failed for {}", path.display()))?;
-    let rgba = img.to_rgba8();
-    let (w, h) = img.dimensions();
-    let pixels = rgba.into_raw();
+/// Load and decode image to RGBA (can be done in background thread)
+fn load_image_rgba(path: &Path) -> Result<RgbaImage> {
+    let img = image::open(path)
+        .with_context(|| format!("image::open failed for {}", path.display()))?;
+    Ok(img.to_rgba8())
+}
 
+/// Convert RgbaImage to egui TextureHandle (must be done on main thread with Context)
+fn rgba_to_texture(ctx: &egui::Context, rgba: RgbaImage) -> Result<TextureHandle> {
+    let (w, h) = rgba.dimensions();
+    let pixels = rgba.into_raw();
     let color_image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
     Ok(ctx.load_texture(
         "zapvis_image",
