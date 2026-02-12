@@ -10,9 +10,44 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use zapvis::PersistentSsh;
+
+/// Request sent to the remote worker thread
+enum RemoteWorkerRequest {
+    Exists {
+        path: String,
+        response_tx: Sender<Result<bool>>,
+    },
+    Cat {
+        path: String,
+        response_tx: Sender<Result<Vec<u8>>>,
+    },
+}
+
+/// Spawn a remote worker thread that exclusively owns the SSH connection
+/// and processes requests serially. Returns the request sender.
+fn spawn_remote_worker(ssh: PersistentSsh) -> Sender<RemoteWorkerRequest> {
+    let (tx, rx) = channel::<RemoteWorkerRequest>();
+    
+    thread::spawn(move || {
+        let mut ssh = ssh;
+        while let Ok(req) = rx.recv() {
+            match req {
+                RemoteWorkerRequest::Exists { path, response_tx } => {
+                    let result = ssh.exists(&path);
+                    let _ = response_tx.send(result);
+                }
+                RemoteWorkerRequest::Cat { path, response_tx } => {
+                    let result = ssh.cat(&path);
+                    let _ = response_tx.send(result);
+                }
+            }
+        }
+    });
+    
+    tx
+}
 
 /// zapvis: sequence-only image viewer.
 /// Opens a file, matches it against configured patterns with # as digit placeholders,
@@ -59,7 +94,6 @@ fn main() -> Result<()> {
         .input
         .ok_or_else(|| anyhow!("Input file is required (unless using --config flag)"))?;
     let input_spec = if let Some((user_host, remote_path)) = parse_remote_input(&input) {
-        ensure_ssh_auth(&user_host)?;
         let file_name = file_name_from_str_path(&remote_path)?;
         let dir = Path::new(&remote_path)
             .parent()
@@ -102,11 +136,11 @@ fn main() -> Result<()> {
         }
     }
 
-    // Establish persistent SSH early if remote
-    let ssh = match &input_spec.source {
+    // Establish persistent SSH early if remote (and spawn worker thread)
+    let remote_worker_tx = match &input_spec.source {
         SequenceSource::Remote { user_host, .. } => {
             match PersistentSsh::connect(user_host) {
-                Ok(s) => Some(Arc::new(Mutex::new(s))),
+                Ok(ssh) => Some(spawn_remote_worker(ssh)),
                 Err(e) => {
                     eprintln!("Failed to establish persistent SSH: {}", e);
                     None
@@ -117,7 +151,7 @@ fn main() -> Result<()> {
     };
 
     // Determine which pattern to use:
-    let (pattern, seq) = match pick_sequence(&cfg, &input_spec, ssh.clone()) {
+    let (pattern, seq) = match pick_sequence(&cfg, &input_spec, remote_worker_tx.clone()) {
         Ok(v) => v,
         Err(e) => {
             // Your rule: if no hits, quit. (No interactive prompt here.)
@@ -135,7 +169,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "zapvis",
         native_options,
-        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq, ssh)))),
+        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq, remote_worker_tx)))),
     )
     .map_err(|e| anyhow!(e.to_string()))?;
 
@@ -188,16 +222,20 @@ impl SequenceSpec {
         }
     }
 
-    fn exists_with_ssh(&self, idx: u64, ssh: Option<Arc<Mutex<PersistentSsh>>>) -> Result<bool> {
+    fn exists_with_ssh(&self, idx: u64, request_tx: Option<Sender<RemoteWorkerRequest>>) -> Result<bool> {
         match &self.source {
             SequenceSource::Local(dir) => Ok(dir.join(self.file_name_for(idx)).exists()),
             SequenceSource::Remote { dir, .. } => {
                 let remote_path = build_remote_path(dir, &self.file_name_for(idx));
-                if let Some(ssh_arc) = ssh {
-                    let mut ssh_guard = ssh_arc.lock().map_err(|e| anyhow!("SSH lock failed: {}", e))?;
-                    ssh_guard.exists(&remote_path)
+                if let Some(tx) = request_tx {
+                    let (response_tx, response_rx) = channel();
+                    tx.send(RemoteWorkerRequest::Exists {
+                        path: remote_path,
+                        response_tx,
+                    })?;
+                    response_rx.recv()?
                 } else {
-                    Err(anyhow!("SSH connection not available"))
+                    Err(anyhow!("Remote SSH connection not available"))
                 }
             }
         }
@@ -292,7 +330,7 @@ fn pattern_matches_file(pat: &str, file_name: &str) -> Result<bool> {
 fn pick_sequence(
     cfg: &Config,
     input: &InputSpec,
-    ssh: Option<Arc<Mutex<PersistentSsh>>>,
+    request_tx: Option<Sender<RemoteWorkerRequest>>,
 ) -> Result<(String, SequenceSpec)> {
     // If config empty, fail quickly.
     if cfg.patterns.is_empty() {
@@ -317,8 +355,8 @@ fn pick_sequence(
             };
 
             // Neighbor evidence via stat(): cheap and avoids enumeration.
-            let has_next = spec.exists_with_ssh(idx + 1, ssh.clone()).unwrap_or(false);
-            let has_prev = idx > 0 && spec.exists_with_ssh(idx - 1, ssh.clone()).unwrap_or(false);
+            let has_next = spec.exists_with_ssh(idx + 1, request_tx.clone()).unwrap_or(false);
+            let has_prev = idx > 0 && spec.exists_with_ssh(idx - 1, request_tx.clone()).unwrap_or(false);
 
             if has_next || has_prev {
                 return Ok((pat.clone(), spec));
@@ -329,36 +367,73 @@ fn pick_sequence(
     Err(anyhow!("No configured pattern matched with neighbor evidence."))
 }
 
-// ---------------- GUI app ----------------
+// Load request for the single background loader thread
+#[derive(Clone)]
+struct LoadRequest {
+    idx: u64,
+    file_name: String,
+    seq_source: SequenceSource,
+    request_tx: Option<Sender<RemoteWorkerRequest>>,
+}
 
 /// Bidirectional image cache with configurable radius.
 /// Maintains textures for indices in range [current - radius, current + radius].
-/// Uses background threads for image decoding to prevent UI freezing.
+/// Uses a single background loader thread with a queue for image decoding.
 struct ImageCache {
     cache: BTreeMap<u64, TextureHandle>,
     cache_radius: usize,
     pending_loads: HashSet<u64>,
-    tx: Sender<(u64, RgbaImage)>,
-    rx: Receiver<(u64, RgbaImage)>,
+    load_request_tx: Sender<LoadRequest>,
+    result_rx: Receiver<(u64, RgbaImage)>,
     seq_source: SequenceSource,
-    ssh: Option<Arc<Mutex<PersistentSsh>>>,
+    request_tx: Option<Sender<RemoteWorkerRequest>>,
 }
 
 impl ImageCache {
     fn new(
         cache_radius: usize,
         seq_source: SequenceSource,
-        ssh: Option<Arc<Mutex<PersistentSsh>>>,
+        request_tx: Option<Sender<RemoteWorkerRequest>>,
     ) -> Self {
-        let (tx, rx) = channel();
+        let (load_request_tx, load_request_rx) = channel::<LoadRequest>();
+        let (result_tx, result_rx) = channel::<(u64, RgbaImage)>();
+
+        // Spawn single loader thread that processes requests from queue
+        thread::spawn(move || {
+            while let Ok(req) = load_request_rx.recv() {
+                let rgba = match &req.seq_source {
+                    SequenceSource::Local(dir) => {
+                        load_image_rgba(&dir.join(&req.file_name))
+                    }
+                    SequenceSource::Remote { user_host, dir } => {
+                        let remote_path = build_remote_path(dir, &req.file_name);
+                        if let Some(tx) = &req.request_tx {
+                            let (response_tx, response_rx) = channel();
+                            tx.send(RemoteWorkerRequest::Cat {
+                                path: remote_path.clone(),
+                                response_tx,
+                            }).context("Failed to send CAT request")?;
+                            let bytes = response_rx.recv().context("remote worker hung up")??;
+                            load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path))
+                        } else {
+                            Err(anyhow!("SSH connection not available for background loading"))
+                        }
+                    }
+                };
+                if let Ok(rgba) = rgba {
+                    let _ = result_tx.send((req.idx, rgba));
+                }
+            }
+        });
+
         Self {
             cache: BTreeMap::new(),
             cache_radius,
             pending_loads: HashSet::new(),
-            tx,
-            rx,
+            load_request_tx,
+            result_rx,
             seq_source,
-            ssh,
+            request_tx,
         }
     }
 
@@ -367,15 +442,17 @@ impl ImageCache {
         self.cache.get(&idx)
     }
 
-    /// Process any decoded images from background threads (convert to textures)
+    /// Process any decoded images from background loader thread (convert to textures)
     fn process_decoded_images(&mut self, ctx: &egui::Context) -> usize {
         let mut converted = 0;
         // Process all available decoded images (non-blocking)
-        while let Ok((idx, rgba_image)) = self.rx.try_recv() {
-            self.pending_loads.remove(&idx);
-            if let Ok(tex) = rgba_to_texture(ctx, rgba_image) {
-                self.cache.insert(idx, tex);
-                converted += 1;
+        while let Ok((idx, rgba_image)) = self.result_rx.try_recv() {
+            // Only insert if this idx is still pending (i.e., not evicted out-of-range)
+            if self.pending_loads.remove(&idx) {
+                if let Ok(tex) = rgba_to_texture(ctx, idx, rgba_image) {
+                    self.cache.insert(idx, tex);
+                    converted += 1;
+                }
             }
         }
         converted
@@ -415,38 +492,22 @@ impl ImageCache {
         let mut launched_count = 0;
         for idx in min_idx..=max_idx {
             if !self.cache.contains_key(&idx) && !self.pending_loads.contains(&idx) {
-                    if seq.exists(idx).unwrap_or(false) {
+                    // For local files: check existence directly. For remote: always try to load
+                    let should_load = match &self.seq_source {
+                        SequenceSource::Local(dir) => dir.join(seq.file_name_for(idx)).exists(),
+                        SequenceSource::Remote { .. } => true,
+                    };
+
+                    if should_load {
                         self.pending_loads.insert(idx);
-                        let tx = self.tx.clone();
-                        let seq_source = self.seq_source.clone();
-                        let ssh = self.ssh.clone();
-                        let prefix = seq.prefix.clone();
-                        let width = seq.width;
-                        let suffix = seq.suffix.clone();
-                        thread::spawn(move || {
-                            let file_name = format!("{}{:0width$}{}", prefix, idx, suffix, width = width);
-                            let rgba = match &seq_source {
-                                SequenceSource::Local(dir) => {
-                                    load_image_rgba(&dir.join(&file_name))
-                                }
-                                SequenceSource::Remote { user_host, dir } => {
-                                    let remote_path = build_remote_path(dir, &file_name);
-                                    if let Some(ssh_arc) = ssh {
-                                        if let Ok(mut ssh_guard) = ssh_arc.lock() {
-                                            ssh_guard.cat(&remote_path)
-                                                .and_then(|bytes| load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path)))
-                                        } else {
-                                            Err(anyhow!("Failed to lock SSH"))
-                                        }
-                                    } else {
-                                        Err(anyhow!("SSH connection not available for background loading"))
-                                    }
-                                }
-                            };
-                            if let Ok(rgba) = rgba {
-                                let _ = tx.send((idx, rgba));
-                            }
-                        });
+                        let file_name = format!("{}{:0width$}{}", seq.prefix, idx, seq.suffix, width = seq.width);
+                        let req = LoadRequest {
+                            idx,
+                            file_name,
+                            seq_source: self.seq_source.clone(),
+                            request_tx: self.request_tx.clone(),
+                        };
+                        let _ = self.load_request_tx.send(req);
                         launched_count += 1;
                     }
             }
@@ -463,6 +524,10 @@ impl ImageCache {
     fn cache_info(&self) -> String {
         format!("Cache: {} loaded, {} pending", self.cache.len(), self.pending_loads.len())
     }
+
+    fn is_pending(&self, idx: u64) -> bool {
+        self.pending_loads.contains(&idx)
+    }
 }
 
 struct ZapVisApp {
@@ -470,7 +535,7 @@ struct ZapVisApp {
     seq: SequenceSpec,
     cache: ImageCache,
     status: String,
-    ssh: Option<Arc<Mutex<PersistentSsh>>>,
+    request_tx: Option<Sender<RemoteWorkerRequest>>,
 }
 
 impl ZapVisApp {
@@ -478,49 +543,16 @@ impl ZapVisApp {
         _cc: &eframe::CreationContext<'_>,
         pattern: String,
         seq: SequenceSpec,
-        ssh: Option<Arc<Mutex<PersistentSsh>>>,
+        request_tx: Option<Sender<RemoteWorkerRequest>>,
     ) -> Self {
-        let cache = ImageCache::new(10, seq.source.clone(), ssh.clone());
+        let cache = ImageCache::new(10, seq.source.clone(), request_tx.clone());
 
         Self {
             pattern,
             seq,
             cache,
             status: String::new(),
-            ssh,
-        }
-    }
-
-    /// Check if a file exists, using persistent SSH if available
-    fn file_exists(&mut self, idx: u64) -> Result<bool> {
-        match &self.seq.source {
-            SequenceSource::Local(dir) => Ok(dir.join(self.seq.file_name_for(idx)).exists()),
-            SequenceSource::Remote { dir, .. } => {
-                let remote_path = build_remote_path(dir, &self.seq.file_name_for(idx));
-                if let Some(ref ssh_arc) = self.ssh {
-                    let mut ssh = ssh_arc.lock().map_err(|e| anyhow!("SSH lock failed: {}", e))?;
-                    ssh.exists(&remote_path)
-                } else {
-                    Err(anyhow!("SSH connection not available"))
-                }
-            }
-        }
-    }
-
-    /// Load image RGBA, using persistent SSH if available
-    fn load_image(&mut self, idx: u64) -> Result<RgbaImage> {
-        match &self.seq.source {
-            SequenceSource::Local(dir) => load_image_rgba(&dir.join(self.seq.file_name_for(idx))),
-            SequenceSource::Remote { user_host, dir } => {
-                let remote_path = build_remote_path(dir, &self.seq.file_name_for(idx));
-                if let Some(ref ssh_arc) = self.ssh {
-                    let mut ssh = ssh_arc.lock().map_err(|e| anyhow!("SSH lock failed: {}", e))?;
-                    let bytes = ssh.cat(&remote_path)?;
-                    load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path))
-                } else {
-                    Err(anyhow!("SSH connection not available"))
-                }
-            }
+            request_tx,
         }
     }
 
@@ -528,7 +560,10 @@ impl ZapVisApp {
         let (loaded, evicted) = self.cache.update_for_index(self.seq.index, &self.seq, ctx);
         
         let path = self.seq.path_display(self.seq.index);
-        if self.cache.get(self.seq.index).is_some() {
+        let idx = self.seq.index;
+        
+        if self.cache.get(idx).is_some() {
+            // Image is cached and ready
             self.status = format!(
                 "{}  (pattern: {})  |  {} | +{} -{}",
                 path,
@@ -537,11 +572,20 @@ impl ZapVisApp {
                 loaded,
                 evicted
             );
+        } else if self.cache.is_pending(idx) {
+            // Image is being loaded
+            self.status = format!(
+                "Loading {} | {}",
+                path,
+                self.cache.cache_info()
+            );
         } else {
-            self.status = format!("Failed to load {} | {} | +{} -{}", 
-                path, 
-                self.cache.cache_info(), 
-                loaded, 
+            // Image not found or failed to load
+            self.status = format!(
+                "Not found / failed: {} | {} | +{} -{}",
+                path,
+                self.cache.cache_info(),
+                loaded,
                 evicted
             );
         }
@@ -554,20 +598,20 @@ impl ZapVisApp {
             return;
         }
         let next_u = next as u64;
-        let p = self.seq.path_display(next_u);
-        match self.file_exists(next_u) {
-            Ok(true) => {
-                self.seq.index = next_u;
-                self.update_cache_and_status(ctx);
-            }
-            Ok(false) => {
-                // strict: don't scan; just stop
+        
+        // For local files, check existence first (fast, non-blocking)
+        if let SequenceSource::Local(dir) = &self.seq.source {
+            if !dir.join(self.seq.file_name_for(next_u)).exists() {
+                let p = self.seq.path_display(next_u);
                 self.status = format!("No file: {} | {}", p, self.cache.cache_info());
-            }
-            Err(e) => {
-                self.status = format!("Error checking {}: {}", p, e);
+                return;
             }
         }
+        
+        // For remote: proceed optimistically (don't block UI with recv())
+        // The cache loader will attempt to fetch and show "Failed to load" if it doesn't exist
+        self.seq.index = next_u;
+        self.update_cache_and_status(ctx);
     }
 }
 
@@ -630,12 +674,12 @@ fn load_image_rgba_from_bytes(bytes: &[u8], source: &str) -> Result<RgbaImage> {
 }
 
 /// Convert RgbaImage to egui TextureHandle (must be done on main thread with Context)
-fn rgba_to_texture(ctx: &egui::Context, rgba: RgbaImage) -> Result<TextureHandle> {
+fn rgba_to_texture(ctx: &egui::Context, idx: u64, rgba: RgbaImage) -> Result<TextureHandle> {
     let (w, h) = rgba.dimensions();
     let pixels = rgba.into_raw();
     let color_image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
     Ok(ctx.load_texture(
-        "zapvis_image",
+        format!("zapvis_image_{idx}"),
         color_image,
         egui::TextureOptions::LINEAR,
     ))
@@ -645,20 +689,6 @@ fn parse_remote_input(input: &str) -> Option<(String, String)> {
     let re = Regex::new(r"^([^@]+@[^:]+):(/.+)$").ok()?;
     let caps = re.captures(input)?;
     Some((caps.get(1)?.as_str().to_string(), caps.get(2)?.as_str().to_string()))
-}
-
-fn ensure_ssh_auth(user_host: &str) -> Result<()> {
-    // Test SSH connectivity with persistent connection
-    match PersistentSsh::connect(user_host) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("ssh auth not available for {}: {}", user_host, e);
-            Err(anyhow!(
-                "SSH auth not available for {}. Configure keys/agent before using remote paths.",
-                user_host
-            ))
-        }
-    }
 }
 
 fn build_remote_path(dir: &str, file_name: &str) -> String {
