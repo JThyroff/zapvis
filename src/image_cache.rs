@@ -18,9 +18,11 @@ struct LoadRequest {
     request_tx: Option<Sender<RemoteWorkerRequest>>,
 }
 
-/// Bidirectional image cache with configurable radius.
-/// Maintains textures for indices in range [current - radius, current + radius].
-/// Uses a single background loader thread with a queue for image decoding.
+/// Bidirectional image cache with lazy sliding window.
+/// Implements a hysteresis-based cache window:
+/// - Window size: 20 images before and after current index (40 total)
+/// - Reload threshold: Only recalculate window when index moves ±10 from center
+/// This reduces unnecessary reloads during back-and-forth navigation.
 pub struct ImageCache {
     cache: BTreeMap<u64, TextureHandle>,
     cache_radius: usize,
@@ -30,6 +32,8 @@ pub struct ImageCache {
     seq_source: SequenceSource,
     request_tx: Option<Sender<RemoteWorkerRequest>>,
     remote_range: Option<RemoteRange>,
+    /// Center of the current cache window (for hysteresis logic)
+    window_center: Option<u64>,
 }
 
 impl ImageCache {
@@ -86,6 +90,7 @@ impl ImageCache {
             seq_source,
             request_tx,
             remote_range,
+            window_center: None,
         }
     }
 
@@ -112,7 +117,10 @@ impl ImageCache {
         converted
     }
 
-    /// Update cache centered on new_index, preloading neighbors and evicting out-of-range entries
+    /// Update cache centered on new_index, preloading neighbors and evicting out-of-range entries.
+    /// Uses a lazy sliding window with hysteresis:
+    /// - Window is only recalculated when new_index moves ±10 from the current window center
+    /// - This avoids unnecessary reloads during back-and-forth navigation
     pub fn update_for_index(
         &mut self,
         new_index: u64,
@@ -121,6 +129,31 @@ impl ImageCache {
     ) -> (usize, usize) {
         // First, process any decoded images waiting to become textures
         self.process_decoded_images(ctx);
+
+        const RELOAD_THRESHOLD: u64 = 10;
+        
+        // Determine if we need to recalculate the window
+        let needs_recalc = match self.window_center {
+            None => true, // First time, always calculate
+            Some(center) => {
+                // Check if current index has moved more than RELOAD_THRESHOLD from center
+                let distance = if new_index > center {
+                    new_index - center
+                } else {
+                    center - new_index
+                };
+                distance > RELOAD_THRESHOLD
+            }
+        };
+
+        if !needs_recalc {
+            // Within the inner window - just process decoded images, no reload
+            return (0, 0);
+        }
+
+        // Update window center to new index
+        self.window_center = Some(new_index);
+        eprintln!("[Cache] window center updated to {}", new_index);
 
         let radius = self.cache_radius as u64;
         let min_idx = new_index.saturating_sub(radius);
