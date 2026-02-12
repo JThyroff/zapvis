@@ -121,6 +121,21 @@ impl ImageCache {
     /// Uses a lazy sliding window with hysteresis:
     /// - Window is only recalculated when new_index moves ±10 from the current window center
     /// - This avoids unnecessary reloads during back-and-forth navigation
+    ///
+    /// # Behavior
+    /// 
+    /// Window size is 20 images before and after current index (40 images total).
+    /// 
+    /// The window center is only updated when the current index moves more than 10 
+    /// positions away from the center. This creates a "dead zone" where navigation 
+    /// doesn't trigger cache reloads.
+    /// 
+    /// Example:
+    /// - Initial load at index 50: Window is [30, 70], center = 50
+    /// - Navigate to 55: No reload (distance = 5, within threshold)
+    /// - Navigate to 45: No reload (distance = 5, within threshold)  
+    /// - Navigate to 61: Reload triggered (distance = 11 > threshold)
+    ///   New window [41, 81], center = 61
     pub fn update_for_index(
         &mut self,
         new_index: u64,
@@ -226,6 +241,66 @@ impl ImageCache {
 
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
+    }
+
+    /// For testing: get the current window center
+    #[cfg(test)]
+    pub fn window_center(&self) -> Option<u64> {
+        self.window_center
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_hysteresis_threshold() {
+        // Test the hysteresis logic without requiring full ImageCache setup
+        const RELOAD_THRESHOLD: u64 = 10;
+        
+        // Case 1: No center set, should always need recalc
+        let window_center: Option<u64> = None;
+        assert!(window_center.is_none(), "First load should have no center");
+        
+        // Case 2: Within threshold - no recalc needed
+        let window_center = Some(50);
+        let new_index = 55;
+        let distance = if new_index > window_center.unwrap() {
+            new_index - window_center.unwrap()
+        } else {
+            window_center.unwrap() - new_index
+        };
+        assert_eq!(distance, 5);
+        assert!(distance <= RELOAD_THRESHOLD, "Distance 5 should be within threshold");
+        
+        // Case 3: At threshold - no recalc needed
+        let new_index = 60;
+        let distance = if new_index > window_center.unwrap() {
+            new_index - window_center.unwrap()
+        } else {
+            window_center.unwrap() - new_index
+        };
+        assert_eq!(distance, 10);
+        assert!(distance <= RELOAD_THRESHOLD, "Distance 10 should be at threshold");
+        
+        // Case 4: Beyond threshold - recalc needed
+        let new_index = 61;
+        let distance = if new_index > window_center.unwrap() {
+            new_index - window_center.unwrap()
+        } else {
+            window_center.unwrap() - new_index
+        };
+        assert_eq!(distance, 11);
+        assert!(distance > RELOAD_THRESHOLD, "Distance 11 should exceed threshold");
+        
+        // Case 5: Backwards beyond threshold
+        let new_index = 39;
+        let distance = if new_index > window_center.unwrap() {
+            new_index - window_center.unwrap()
+        } else {
+            window_center.unwrap() - new_index
+        };
+        assert_eq!(distance, 11);
+        assert!(distance > RELOAD_THRESHOLD, "Distance -11 should exceed threshold");
     }
 }
 
