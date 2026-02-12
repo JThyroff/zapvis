@@ -213,15 +213,6 @@ impl SequenceSpec {
         }
     }
 
-    fn exists(&self, idx: u64) -> Result<bool> {
-        match &self.source {
-            SequenceSource::Local(dir) => Ok(dir.join(self.file_name_for(idx)).exists()),
-            SequenceSource::Remote { .. } => {
-                Err(anyhow!("Use exists_with_ssh for remote files"))
-            }
-        }
-    }
-
     fn exists_with_ssh(&self, idx: u64, request_tx: Option<Sender<RemoteWorkerRequest>>) -> Result<bool> {
         match &self.source {
             SequenceSource::Local(dir) => Ok(dir.join(self.file_name_for(idx)).exists()),
@@ -539,7 +530,6 @@ struct ZapVisApp {
     seq: SequenceSpec,
     cache: ImageCache,
     status: String,
-    request_tx: Option<Sender<RemoteWorkerRequest>>,
 }
 
 impl ZapVisApp {
@@ -549,14 +539,13 @@ impl ZapVisApp {
         seq: SequenceSpec,
         request_tx: Option<Sender<RemoteWorkerRequest>>,
     ) -> Self {
-        let cache = ImageCache::new(10, seq.source.clone(), request_tx.clone());
+        let cache = ImageCache::new(10, seq.source.clone(), request_tx);
 
         Self {
             pattern,
             seq,
             cache,
             status: String::new(),
-            request_tx,
         }
     }
 
