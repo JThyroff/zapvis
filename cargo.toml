@@ -1,0 +1,19 @@
+[package]
+name = "zapvis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+directories = "5.0"
+regex = "1.10"
+anyhow = "1.0"
+
+# GUI + rendering
+eframe = "0.29"
+egui = "0.29"
+
+# Image decoding
+image = { version = "0.25", default-features = true }
