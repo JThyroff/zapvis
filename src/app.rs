@@ -1,0 +1,142 @@
+use eframe::egui;
+use std::sync::mpsc::Sender;
+
+use crate::image_cache::ImageCache;
+use crate::remote_worker::{RemoteRange, RemoteWorkerRequest};
+use crate::sequence::{SequenceSource, SequenceSpec};
+
+pub struct ZapVisApp {
+    pattern: String,
+    seq: SequenceSpec,
+    cache: ImageCache,
+    status: String,
+}
+
+impl ZapVisApp {
+    pub fn new(
+        _cc: &eframe::CreationContext<'_>,
+        pattern: String,
+        seq: SequenceSpec,
+        request_tx: Option<Sender<RemoteWorkerRequest>>,
+        remote_range: RemoteRange,
+    ) -> Self {
+        let cache_remote_range = match &seq.source {
+            SequenceSource::Remote { .. } => Some(remote_range),
+            SequenceSource::Local(_) => None,
+        };
+        let cache = ImageCache::new(10, seq.source.clone(), request_tx, cache_remote_range);
+
+        Self {
+            pattern,
+            seq,
+            cache,
+            status: String::new(),
+        }
+    }
+
+    fn update_cache_and_status(&mut self, ctx: &egui::Context) {
+        let (loaded, evicted) = self.cache.update_for_index(self.seq.index, &self.seq, ctx);
+
+        let path = self.seq.path_display(self.seq.index);
+        let idx = self.seq.index;
+
+        if self.cache.get(idx).is_some() {
+            // Image is cached and ready
+            self.status = format!(
+                "{}  (pattern: {})  |  {} | +{} -{}",
+                path,
+                self.pattern,
+                self.cache.cache_info(),
+                loaded,
+                evicted
+            );
+        } else if self.cache.is_pending(idx) {
+            // Image is being loaded
+            self.status = format!(
+                "Loading {} | {}",
+                path,
+                self.cache.cache_info()
+            );
+        } else {
+            // Image not found or failed to load
+            self.status = format!(
+                "Not found / failed: {} | {} | +{} -{}",
+                path,
+                self.cache.cache_info(),
+                loaded,
+                evicted
+            );
+        }
+    }
+
+    fn try_step(&mut self, ctx: &egui::Context, delta: i64) {
+        let cur = self.seq.index as i64;
+        let next = cur + delta;
+        if next < 0 {
+            return;
+        }
+        let next_u = next as u64;
+        eprintln!("[Step] navigating from {} to {}", cur, next_u);
+
+        // For local files, check existence first (fast, non-blocking)
+        if let SequenceSource::Local(dir) = &self.seq.source {
+            if !dir.join(self.seq.file_name_for(next_u)).exists() {
+                let p = self.seq.path_display(next_u);
+                self.status = format!("No file: {} | {}", p, self.cache.cache_info());
+                eprintln!("[Step] file not found: {}", p);
+                return;
+            }
+        }
+
+        // For remote: proceed optimistically (don't block UI with recv())
+        // The cache loader will attempt to fetch and show "Failed to load" if it doesn't exist
+        self.seq.index = next_u;
+        self.update_cache_and_status(ctx);
+    }
+}
+
+impl eframe::App for ZapVisApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process any decoded images from background threads
+        self.cache.tick(ctx);
+
+        // Load initial cache once
+        if self.cache.is_empty() && self.status.is_empty() {
+            self.update_cache_and_status(ctx);
+        }
+
+        // Keyboard navigation
+        let input = ctx.input(|i| i.clone());
+        if input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::D) {
+            self.try_step(ctx, 1);
+        }
+        if input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::A) {
+            self.try_step(ctx, -1);
+        }
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.label(&self.status);
+            ui.label("Keys: Left/Right or A/D. Esc closes the window.");
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(tex) = self.cache.get(self.seq.index) {
+                let avail = ui.available_size();
+
+                let tex_size = tex.size_vec2();
+                let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y).min(1.0);
+                let size = tex_size * scale;
+
+                ui.add(egui::Image::new(tex).fit_to_exact_size(size));
+            } else {
+                ui.label("No image loaded.");
+            }
+        });
+
+        // Allow ESC to quit (closes SSH connection and stops all pending image loads)
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            eprintln!("[UI] ESC pressed, closing application");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
