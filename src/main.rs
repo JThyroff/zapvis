@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use zapvis::PersistentSsh;
 
 /// zapvis: sequence-only image viewer.
 /// Opens a file, matches it against configured patterns with # as digit placeholders,
@@ -101,8 +102,22 @@ fn main() -> Result<()> {
         }
     }
 
+    // Establish persistent SSH early if remote
+    let ssh = match &input_spec.source {
+        SequenceSource::Remote { user_host, .. } => {
+            match PersistentSsh::connect(user_host) {
+                Ok(s) => Some(Arc::new(Mutex::new(s))),
+                Err(e) => {
+                    eprintln!("Failed to establish persistent SSH: {}", e);
+                    None
+                }
+            }
+        }
+        SequenceSource::Local(_) => None,
+    };
+
     // Determine which pattern to use:
-    let (pattern, seq) = match pick_sequence(&cfg, &input_spec) {
+    let (pattern, seq) = match pick_sequence(&cfg, &input_spec, ssh.clone()) {
         Ok(v) => v,
         Err(e) => {
             // Your rule: if no hits, quit. (No interactive prompt here.)
@@ -120,7 +135,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "zapvis",
         native_options,
-        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq)))),
+        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq, ssh)))),
     )
     .map_err(|e| anyhow!(e.to_string()))?;
 
@@ -167,19 +182,23 @@ impl SequenceSpec {
     fn exists(&self, idx: u64) -> Result<bool> {
         match &self.source {
             SequenceSource::Local(dir) => Ok(dir.join(self.file_name_for(idx)).exists()),
-            SequenceSource::Remote { user_host, dir } => {
-                let remote_path = build_remote_path(dir, &self.file_name_for(idx));
-                ssh_test_file(user_host, &remote_path)
+            SequenceSource::Remote { .. } => {
+                Err(anyhow!("Use exists_with_ssh for remote files"))
             }
         }
     }
 
-    fn load_rgba(&self, idx: u64) -> Result<RgbaImage> {
+    fn exists_with_ssh(&self, idx: u64, ssh: Option<Arc<Mutex<PersistentSsh>>>) -> Result<bool> {
         match &self.source {
-            SequenceSource::Local(dir) => load_image_rgba(&dir.join(self.file_name_for(idx))),
-            SequenceSource::Remote { user_host, dir } => {
+            SequenceSource::Local(dir) => Ok(dir.join(self.file_name_for(idx)).exists()),
+            SequenceSource::Remote { dir, .. } => {
                 let remote_path = build_remote_path(dir, &self.file_name_for(idx));
-                load_image_rgba_remote(user_host, &remote_path)
+                if let Some(ssh_arc) = ssh {
+                    let mut ssh_guard = ssh_arc.lock().map_err(|e| anyhow!("SSH lock failed: {}", e))?;
+                    ssh_guard.exists(&remote_path)
+                } else {
+                    Err(anyhow!("SSH connection not available"))
+                }
             }
         }
     }
@@ -270,7 +289,11 @@ fn pattern_matches_file(pat: &str, file_name: &str) -> Result<bool> {
 
 /// Try patterns from config; return first that matches AND has neighbor evidence.
 /// Evidence: current file matches and at least one neighbor exists (idx±1).
-fn pick_sequence(cfg: &Config, input: &InputSpec) -> Result<(String, SequenceSpec)> {
+fn pick_sequence(
+    cfg: &Config,
+    input: &InputSpec,
+    ssh: Option<Arc<Mutex<PersistentSsh>>>,
+) -> Result<(String, SequenceSpec)> {
     // If config empty, fail quickly.
     if cfg.patterns.is_empty() {
         return Err(anyhow!("No patterns configured."));
@@ -294,8 +317,8 @@ fn pick_sequence(cfg: &Config, input: &InputSpec) -> Result<(String, SequenceSpe
             };
 
             // Neighbor evidence via stat(): cheap and avoids enumeration.
-            let has_next = spec.exists(idx + 1).unwrap_or(false);
-            let has_prev = idx > 0 && spec.exists(idx - 1).unwrap_or(false);
+            let has_next = spec.exists_with_ssh(idx + 1, ssh.clone()).unwrap_or(false);
+            let has_prev = idx > 0 && spec.exists_with_ssh(idx - 1, ssh.clone()).unwrap_or(false);
 
             if has_next || has_prev {
                 return Ok((pat.clone(), spec));
@@ -317,10 +340,16 @@ struct ImageCache {
     pending_loads: HashSet<u64>,
     tx: Sender<(u64, RgbaImage)>,
     rx: Receiver<(u64, RgbaImage)>,
+    seq_source: SequenceSource,
+    ssh: Option<Arc<Mutex<PersistentSsh>>>,
 }
 
 impl ImageCache {
-    fn new(cache_radius: usize) -> Self {
+    fn new(
+        cache_radius: usize,
+        seq_source: SequenceSource,
+        ssh: Option<Arc<Mutex<PersistentSsh>>>,
+    ) -> Self {
         let (tx, rx) = channel();
         Self {
             cache: BTreeMap::new(),
@@ -328,6 +357,8 @@ impl ImageCache {
             pending_loads: HashSet::new(),
             tx,
             rx,
+            seq_source,
+            ssh,
         }
     }
 
@@ -387,9 +418,32 @@ impl ImageCache {
                     if seq.exists(idx).unwrap_or(false) {
                         self.pending_loads.insert(idx);
                         let tx = self.tx.clone();
-                        let seq_clone = seq.clone();
+                        let seq_source = self.seq_source.clone();
+                        let ssh = self.ssh.clone();
+                        let prefix = seq.prefix.clone();
+                        let width = seq.width;
+                        let suffix = seq.suffix.clone();
                         thread::spawn(move || {
-                            if let Ok(rgba) = seq_clone.load_rgba(idx) {
+                            let file_name = format!("{}{:0width$}{}", prefix, idx, suffix, width = width);
+                            let rgba = match &seq_source {
+                                SequenceSource::Local(dir) => {
+                                    load_image_rgba(&dir.join(&file_name))
+                                }
+                                SequenceSource::Remote { user_host, dir } => {
+                                    let remote_path = build_remote_path(dir, &file_name);
+                                    if let Some(ssh_arc) = ssh {
+                                        if let Ok(mut ssh_guard) = ssh_arc.lock() {
+                                            ssh_guard.cat(&remote_path)
+                                                .and_then(|bytes| load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path)))
+                                        } else {
+                                            Err(anyhow!("Failed to lock SSH"))
+                                        }
+                                    } else {
+                                        Err(anyhow!("SSH connection not available for background loading"))
+                                    }
+                                }
+                            };
+                            if let Ok(rgba) = rgba {
                                 let _ = tx.send((idx, rgba));
                             }
                         });
@@ -416,15 +470,57 @@ struct ZapVisApp {
     seq: SequenceSpec,
     cache: ImageCache,
     status: String,
+    ssh: Option<Arc<Mutex<PersistentSsh>>>,
 }
 
 impl ZapVisApp {
-    fn new(_cc: &eframe::CreationContext<'_>, pattern: String, seq: SequenceSpec) -> Self {
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        pattern: String,
+        seq: SequenceSpec,
+        ssh: Option<Arc<Mutex<PersistentSsh>>>,
+    ) -> Self {
+        let cache = ImageCache::new(10, seq.source.clone(), ssh.clone());
+
         Self {
             pattern,
             seq,
-            cache: ImageCache::new(10), // Default: 10 images before/after (21 total)
+            cache,
             status: String::new(),
+            ssh,
+        }
+    }
+
+    /// Check if a file exists, using persistent SSH if available
+    fn file_exists(&mut self, idx: u64) -> Result<bool> {
+        match &self.seq.source {
+            SequenceSource::Local(dir) => Ok(dir.join(self.seq.file_name_for(idx)).exists()),
+            SequenceSource::Remote { dir, .. } => {
+                let remote_path = build_remote_path(dir, &self.seq.file_name_for(idx));
+                if let Some(ref ssh_arc) = self.ssh {
+                    let mut ssh = ssh_arc.lock().map_err(|e| anyhow!("SSH lock failed: {}", e))?;
+                    ssh.exists(&remote_path)
+                } else {
+                    Err(anyhow!("SSH connection not available"))
+                }
+            }
+        }
+    }
+
+    /// Load image RGBA, using persistent SSH if available
+    fn load_image(&mut self, idx: u64) -> Result<RgbaImage> {
+        match &self.seq.source {
+            SequenceSource::Local(dir) => load_image_rgba(&dir.join(self.seq.file_name_for(idx))),
+            SequenceSource::Remote { user_host, dir } => {
+                let remote_path = build_remote_path(dir, &self.seq.file_name_for(idx));
+                if let Some(ref ssh_arc) = self.ssh {
+                    let mut ssh = ssh_arc.lock().map_err(|e| anyhow!("SSH lock failed: {}", e))?;
+                    let bytes = ssh.cat(&remote_path)?;
+                    load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path))
+                } else {
+                    Err(anyhow!("SSH connection not available"))
+                }
+            }
         }
     }
 
@@ -459,7 +555,7 @@ impl ZapVisApp {
         }
         let next_u = next as u64;
         let p = self.seq.path_display(next_u);
-        match self.seq.exists(next_u) {
+        match self.file_exists(next_u) {
             Ok(true) => {
                 self.seq.index = next_u;
                 self.update_cache_and_status(ctx);
@@ -527,38 +623,6 @@ fn load_image_rgba(path: &Path) -> Result<RgbaImage> {
     Ok(img.to_rgba8())
 }
 
-fn load_image_rgba_remote(user_host: &str, remote_path: &str) -> Result<RgbaImage> {
-    eprintln!("ssh cat {}:{}", user_host, remote_path);
-    let mut cmd = Command::new("ssh");
-    for arg in ssh_base_args() {
-        cmd.arg(arg);
-    }
-    let output = cmd
-        .arg(user_host)
-        .arg("cat")
-        .arg(remote_path)
-        .output()
-        .with_context(|| format!("ssh cat failed for {}:{}", user_host, remote_path))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "ssh cat failed for {}:{}: {}",
-            user_host,
-            remote_path,
-            stderr.trim()
-        );
-        return Err(anyhow!(
-            "ssh cat failed for {}:{}: {}",
-            user_host,
-            remote_path,
-            stderr.trim()
-        ));
-    }
-
-    load_image_rgba_from_bytes(&output.stdout, &format!("{}:{}", user_host, remote_path))
-}
-
 fn load_image_rgba_from_bytes(bytes: &[u8], source: &str) -> Result<RgbaImage> {
     let img = image::load_from_memory(bytes)
         .with_context(|| format!("image::load_from_memory failed for {}", source))?;
@@ -584,63 +648,17 @@ fn parse_remote_input(input: &str) -> Option<(String, String)> {
 }
 
 fn ensure_ssh_auth(user_host: &str) -> Result<()> {
-    eprintln!("ssh auth check {}", user_host);
-    let mut cmd = Command::new("ssh");
-    for arg in ssh_base_args() {
-        cmd.arg(arg);
+    // Test SSH connectivity with persistent connection
+    match PersistentSsh::connect(user_host) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("ssh auth not available for {}: {}", user_host, e);
+            Err(anyhow!(
+                "SSH auth not available for {}. Configure keys/agent before using remote paths.",
+                user_host
+            ))
+        }
     }
-    let status = cmd
-        .arg(user_host)
-        .arg("true")
-        .status()
-        .with_context(|| format!("ssh auth check failed for {}", user_host))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        eprintln!("ssh auth not available for {}", user_host);
-        Err(anyhow!(
-            "SSH auth not available for {}. Configure keys/agent before using remote paths.",
-            user_host
-        ))
-    }
-}
-
-fn ssh_test_file(user_host: &str, remote_path: &str) -> Result<bool> {
-    eprintln!("ssh test -f {}:{}", user_host, remote_path);
-    let mut cmd = Command::new("ssh");
-    for arg in ssh_base_args() {
-        cmd.arg(arg);
-    }
-    let output = cmd
-        .arg(user_host)
-        .arg("test")
-        .arg("-f")
-        .arg(remote_path)
-        .output()
-        .with_context(|| format!("ssh test failed for {}:{}", user_host, remote_path))?;
-
-    if output.status.success() {
-        return Ok(true);
-    }
-
-    if output.status.code() == Some(1) {
-        return Ok(false);
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!(
-        "ssh test failed for {}:{}: {}",
-        user_host,
-        remote_path,
-        stderr.trim()
-    );
-    Err(anyhow!(
-        "ssh test failed for {}:{}: {}",
-        user_host,
-        remote_path,
-        stderr.trim()
-    ))
 }
 
 fn build_remote_path(dir: &str, file_name: &str) -> String {
@@ -665,38 +683,4 @@ fn file_name_from_str_path(path: &str) -> Result<String> {
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
-}
-
-fn ssh_base_args() -> Vec<String> {
-    let mut args = vec![
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=5".to_string(),
-        "-p".to_string(),
-        "58022".to_string(),
-        "-o".to_string(),
-        "ControlMaster=auto".to_string(),
-        "-o".to_string(),
-        "ControlPersist=30s".to_string(),
-        "-o".to_string(),
-    ];
-    
-    // Build ControlPath: use temp dir on Windows, ~/.ssh on Unix
-    let control_path = if cfg!(windows) {
-        if let Ok(temp) = std::env::var("TEMP") {
-            format!("{}\\zapvis-%r@%h_%p", temp)
-        } else {
-            "zapvis-%r@%h_%p".to_string()
-        }
-    } else {
-        if let Ok(home) = std::env::var("HOME") {
-            format!("{}/.ssh/zapvis-%r@%h:%p", home)
-        } else {
-            "/tmp/zapvis-%r@%h:%p".to_string()
-        }
-    };
-    
-    args.push(format!("ControlPath={}", control_path));
-    args
 }
