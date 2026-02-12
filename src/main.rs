@@ -3,7 +3,7 @@ use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
-use image::{GenericImageView, RgbaImage};
+use image::RgbaImage;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -128,7 +128,6 @@ fn main() -> Result<()> {
 }
 
 /// Represents a compiled sequence extracted from a filename pattern and a concrete file.
-#[derive(Debug, Clone)]
 #[derive(Debug, Clone)]
 enum SequenceSource {
     Local(PathBuf),
