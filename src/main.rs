@@ -642,12 +642,14 @@ fn file_name_from_str_path(path: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
 }
 
-fn ssh_base_args() -> [&'static str; 10] {
+fn ssh_base_args() -> [&'static str; 12] {
     [
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=5",
+        "-p",
+        "58022",
         "-o",
         "ControlMaster=auto",
         "-o",
