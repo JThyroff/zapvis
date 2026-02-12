@@ -20,7 +20,7 @@ use std::thread;
 #[command(author, version, about)]
 struct Args {
     /// Image file to open (recommended). Folder mode is intentionally not supported.
-    input: Option<PathBuf>,
+    input: Option<String>,
 
     /// Optional pattern override, e.g. "########_#.png"
     #[arg(long)]
@@ -57,8 +57,7 @@ fn main() -> Result<()> {
     let input = args
         .input
         .ok_or_else(|| anyhow!("Input file is required (unless using --config flag)"))?;
-    let input_str = input.to_string_lossy();
-    let input_spec = if let Some((user_host, remote_path)) = parse_remote_input(&input_str) {
+    let input_spec = if let Some((user_host, remote_path)) = parse_remote_input(&input) {
         ensure_ssh_auth(&user_host)?;
         let file_name = file_name_from_str_path(&remote_path)?;
         let dir = Path::new(&remote_path)
@@ -71,6 +70,7 @@ fn main() -> Result<()> {
             source: SequenceSource::Remote { user_host, dir },
         }
     } else {
+        let input = PathBuf::from(&input);
         if !input.is_file() {
             return Err(anyhow!(
                 "Input must be an image FILE path. Folder mode is intentionally not supported."
