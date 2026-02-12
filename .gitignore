@@ -31,3 +31,6 @@ Thumbs.db
 # --- User config / runtime data ---
 # zapvis stores user patterns here; do NOT commit
 **/config.toml
+
+# --- Examples ---
+examples/test.rs
