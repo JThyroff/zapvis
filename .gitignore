@@ -1,0 +1,33 @@
+# --- Rust ---
+/target/
+**/*.rs.bk
+
+# --- Cargo ---
+Cargo.lock
+# (keep Cargo.lock ignored for binaries; commit it only for libraries)
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.log
+
+# --- IDEs ---
+.vscode/
+.idea/
+
+# --- Windows build noise ---
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+
+# --- egui / app runtime ---
+.egui/
+
+# --- User config / runtime data ---
+# zapviz stores user patterns here; do NOT commit
+**/config.toml
