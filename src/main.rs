@@ -401,25 +401,29 @@ impl ImageCache {
         // Spawn single loader thread that processes requests from queue
         thread::spawn(move || {
             while let Ok(req) = load_request_rx.recv() {
-                let rgba = match &req.seq_source {
-                    SequenceSource::Local(dir) => {
-                        load_image_rgba(&dir.join(&req.file_name))
-                    }
-                    SequenceSource::Remote { user_host, dir } => {
-                        let remote_path = build_remote_path(dir, &req.file_name);
-                        if let Some(tx) = &req.request_tx {
-                            let (response_tx, response_rx) = channel();
-                            tx.send(RemoteWorkerRequest::Cat {
-                                path: remote_path.clone(),
-                                response_tx,
-                            }).context("Failed to send CAT request")?;
-                            let bytes = response_rx.recv().context("remote worker hung up")??;
-                            load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path))
-                        } else {
-                            Err(anyhow!("SSH connection not available for background loading"))
+                // Wrap in closure that returns Result to use ?
+                let rgba: Result<RgbaImage> = (|| {
+                    match &req.seq_source {
+                        SequenceSource::Local(dir) => {
+                            load_image_rgba(&dir.join(&req.file_name))
+                        }
+                        SequenceSource::Remote { user_host, dir } => {
+                            let remote_path = build_remote_path(dir, &req.file_name);
+                            if let Some(tx) = &req.request_tx {
+                                let (response_tx, response_rx) = channel();
+                                tx.send(RemoteWorkerRequest::Cat {
+                                    path: remote_path.clone(),
+                                    response_tx,
+                                }).context("Failed to send CAT request")?;
+                                let bytes = response_rx.recv().context("remote worker hung up")??;
+                                load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path))
+                            } else {
+                                Err(anyhow!("SSH connection not available for background loading"))
+                            }
                         }
                     }
-                };
+                })();
+                
                 if let Ok(rgba) = rgba {
                     let _ = result_tx.send((req.idx, rgba));
                 }
