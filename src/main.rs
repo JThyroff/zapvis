@@ -529,15 +529,10 @@ fn load_image_rgba(path: &Path) -> Result<RgbaImage> {
 
 fn load_image_rgba_remote(user_host: &str, remote_path: &str) -> Result<RgbaImage> {
     let output = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            user_host,
-            "cat",
-            remote_path,
-        ])
+        .args(ssh_base_args())
+        .arg(user_host)
+        .arg("cat")
+        .arg(remote_path)
         .output()
         .with_context(|| format!("ssh cat failed for {}:{}", user_host, remote_path))?;
 
@@ -580,14 +575,9 @@ fn parse_remote_input(input: &str) -> Option<(String, String)> {
 
 fn ensure_ssh_auth(user_host: &str) -> Result<()> {
     let status = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            user_host,
-            "true",
-        ])
+        .args(ssh_base_args())
+        .arg(user_host)
+        .arg("true")
         .status()
         .with_context(|| format!("ssh auth check failed for {}", user_host))?;
 
@@ -603,16 +593,11 @@ fn ensure_ssh_auth(user_host: &str) -> Result<()> {
 
 fn ssh_test_file(user_host: &str, remote_path: &str) -> Result<bool> {
     let output = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            user_host,
-            "test",
-            "-f",
-            remote_path,
-        ])
+        .args(ssh_base_args())
+        .arg(user_host)
+        .arg("test")
+        .arg("-f")
+        .arg(remote_path)
         .output()
         .with_context(|| format!("ssh test failed for {}:{}", user_host, remote_path))?;
 
@@ -655,4 +640,19 @@ fn file_name_from_str_path(path: &str) -> Result<String> {
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
+}
+
+fn ssh_base_args() -> [&'static str; 10] {
+    [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=30s",
+        "-o",
+        "ControlPath=~/.ssh/zapvis-%r@%h:%p",
+    ]
 }
