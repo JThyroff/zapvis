@@ -10,8 +10,36 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::thread;
 use zapvis::PersistentSsh;
+
+/// Shared range state for remote worker to check if requests are still needed
+#[derive(Clone)]
+struct RemoteRange {
+    min: Arc<AtomicU64>,
+    max: Arc<AtomicU64>,
+}
+
+impl RemoteRange {
+    fn new() -> Self {
+        Self {
+            min: Arc::new(AtomicU64::new(0)),
+            max: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    fn set(&self, min: u64, max: u64) {
+        self.min.store(min, Ordering::Relaxed);
+        self.max.store(max, Ordering::Relaxed);
+    }
+
+    fn contains(&self, idx: u64) -> bool {
+        let min = self.min.load(Ordering::Relaxed);
+        let max = self.max.load(Ordering::Relaxed);
+        idx >= min && idx <= max
+    }
+}
 
 /// Request sent to the remote worker thread
 enum RemoteWorkerRequest {
@@ -20,6 +48,7 @@ enum RemoteWorkerRequest {
         response_tx: Sender<Result<bool>>,
     },
     Cat {
+        idx: u64,
         path: String,
         response_tx: Sender<Result<Vec<u8>>>,
     },
@@ -27,7 +56,7 @@ enum RemoteWorkerRequest {
 
 /// Spawn a remote worker thread that exclusively owns the SSH connection
 /// and processes requests serially. Returns the request sender.
-fn spawn_remote_worker(ssh: PersistentSsh) -> Sender<RemoteWorkerRequest> {
+fn spawn_remote_worker(ssh: PersistentSsh, range: RemoteRange) -> Sender<RemoteWorkerRequest> {
     let (tx, rx) = channel::<RemoteWorkerRequest>();
     
     thread::spawn(move || {
@@ -39,8 +68,15 @@ fn spawn_remote_worker(ssh: PersistentSsh) -> Sender<RemoteWorkerRequest> {
                     let result = ssh.exists(&path);
                     let _ = response_tx.send(result);
                 }
-                RemoteWorkerRequest::Cat { path, response_tx } => {
-                    eprintln!("[SSH worker] executing: cat {}", path);
+                RemoteWorkerRequest::Cat { idx, path, response_tx } => {
+                    // Check if idx is still in range before executing expensive cat
+                    if !range.contains(idx) {
+                        eprintln!("[SSH worker] cat SKIP idx={} (out of range)", idx);
+                        let _ = response_tx.send(Err(anyhow!("cancelled: out of range")));
+                        continue;
+                    }
+
+                    eprintln!("[SSH worker] executing: cat {} (idx={})", path, idx);
                     let result = ssh.cat(&path);
                     if let Ok(ref bytes) = result {
                         eprintln!("[SSH worker] cat result: {} bytes", bytes.len());
@@ -145,12 +181,13 @@ fn main() -> Result<()> {
     }
 
     // Establish persistent SSH early if remote (and spawn worker thread)
+    let remote_range = RemoteRange::new();
     let remote_worker_tx = match &input_spec.source {
         SequenceSource::Remote { user_host, .. } => {
             match PersistentSsh::connect(user_host) {
                 Ok(ssh) => {
                     eprintln!("[SSH] Connected to {}", user_host);
-                    Some(spawn_remote_worker(ssh))
+                    Some(spawn_remote_worker(ssh, remote_range.clone()))
                 }
                 Err(e) => {
                     eprintln!("Failed to establish persistent SSH: {}", e);
@@ -180,7 +217,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "zapvis",
         native_options,
-        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq, remote_worker_tx)))),
+        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq, remote_worker_tx, remote_range)))),
     )
     .map_err(|e| anyhow!(e.to_string()))?;
 
@@ -390,6 +427,7 @@ struct ImageCache {
     result_rx: Receiver<(u64, RgbaImage)>,
     seq_source: SequenceSource,
     request_tx: Option<Sender<RemoteWorkerRequest>>,
+    remote_range: Option<RemoteRange>,
 }
 
 impl ImageCache {
@@ -397,6 +435,7 @@ impl ImageCache {
         cache_radius: usize,
         seq_source: SequenceSource,
         request_tx: Option<Sender<RemoteWorkerRequest>>,
+        remote_range: Option<RemoteRange>,
     ) -> Self {
         let (load_request_tx, load_request_rx) = channel::<LoadRequest>();
         let (result_tx, result_rx) = channel::<(u64, RgbaImage)>();
@@ -416,6 +455,7 @@ impl ImageCache {
                                 let (response_tx, response_rx) = channel();
                                 eprintln!("[SSH] cat: {} (idx={})", remote_path, req.idx);
                                 tx.send(RemoteWorkerRequest::Cat {
+                                    idx: req.idx,
                                     path: remote_path.clone(),
                                     response_tx,
                                 }).context("Failed to send CAT request")?;
@@ -443,6 +483,7 @@ impl ImageCache {
             result_rx,
             seq_source,
             request_tx,
+            remote_range,
         }
     }
 
@@ -482,6 +523,11 @@ impl ImageCache {
         let radius = self.cache_radius as u64;
         let min_idx = new_index.saturating_sub(radius);
         let max_idx = new_index.saturating_add(radius);
+
+        // Update remote range for SSH worker to check
+        if let Some(r) = &self.remote_range {
+            r.set(min_idx, max_idx);
+        }
 
         // Evict entries outside the desired range
         let to_evict: Vec<u64> = self
@@ -570,8 +616,13 @@ impl ZapVisApp {
         pattern: String,
         seq: SequenceSpec,
         request_tx: Option<Sender<RemoteWorkerRequest>>,
+        remote_range: RemoteRange,
     ) -> Self {
-        let cache = ImageCache::new(10, seq.source.clone(), request_tx);
+        let cache_remote_range = match &seq.source {
+            SequenceSource::Remote { .. } => Some(remote_range),
+            SequenceSource::Local(_) => None,
+        };
+        let cache = ImageCache::new(10, seq.source.clone(), request_tx, cache_remote_range);
 
         Self {
             pattern,
