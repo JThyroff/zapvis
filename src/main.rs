@@ -528,6 +528,7 @@ fn load_image_rgba(path: &Path) -> Result<RgbaImage> {
 }
 
 fn load_image_rgba_remote(user_host: &str, remote_path: &str) -> Result<RgbaImage> {
+    eprintln!("ssh cat {}:{}", user_host, remote_path);
     let output = Command::new("ssh")
         .args(ssh_base_args())
         .arg(user_host)
@@ -538,6 +539,12 @@ fn load_image_rgba_remote(user_host: &str, remote_path: &str) -> Result<RgbaImag
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "ssh cat failed for {}:{}: {}",
+            user_host,
+            remote_path,
+            stderr.trim()
+        );
         return Err(anyhow!(
             "ssh cat failed for {}:{}: {}",
             user_host,
@@ -574,6 +581,7 @@ fn parse_remote_input(input: &str) -> Option<(String, String)> {
 }
 
 fn ensure_ssh_auth(user_host: &str) -> Result<()> {
+    eprintln!("ssh auth check {}", user_host);
     let status = Command::new("ssh")
         .args(ssh_base_args())
         .arg(user_host)
@@ -584,6 +592,7 @@ fn ensure_ssh_auth(user_host: &str) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
+        eprintln!("ssh auth not available for {}", user_host);
         Err(anyhow!(
             "SSH auth not available for {}. Configure keys/agent before using remote paths.",
             user_host
@@ -592,6 +601,7 @@ fn ensure_ssh_auth(user_host: &str) -> Result<()> {
 }
 
 fn ssh_test_file(user_host: &str, remote_path: &str) -> Result<bool> {
+    eprintln!("ssh test -f {}:{}", user_host, remote_path);
     let output = Command::new("ssh")
         .args(ssh_base_args())
         .arg(user_host)
@@ -610,6 +620,12 @@ fn ssh_test_file(user_host: &str, remote_path: &str) -> Result<bool> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "ssh test failed for {}:{}: {}",
+        user_host,
+        remote_path,
+        stderr.trim()
+    );
     Err(anyhow!(
         "ssh test failed for {}:{}: {}",
         user_host,
