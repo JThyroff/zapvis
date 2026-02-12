@@ -529,8 +529,11 @@ fn load_image_rgba(path: &Path) -> Result<RgbaImage> {
 
 fn load_image_rgba_remote(user_host: &str, remote_path: &str) -> Result<RgbaImage> {
     eprintln!("ssh cat {}:{}", user_host, remote_path);
-    let output = Command::new("ssh")
-        .args(ssh_base_args())
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_base_args() {
+        cmd.arg(arg);
+    }
+    let output = cmd
         .arg(user_host)
         .arg("cat")
         .arg(remote_path)
@@ -582,8 +585,11 @@ fn parse_remote_input(input: &str) -> Option<(String, String)> {
 
 fn ensure_ssh_auth(user_host: &str) -> Result<()> {
     eprintln!("ssh auth check {}", user_host);
-    let status = Command::new("ssh")
-        .args(ssh_base_args())
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_base_args() {
+        cmd.arg(arg);
+    }
+    let status = cmd
         .arg(user_host)
         .arg("true")
         .status()
@@ -602,8 +608,11 @@ fn ensure_ssh_auth(user_host: &str) -> Result<()> {
 
 fn ssh_test_file(user_host: &str, remote_path: &str) -> Result<bool> {
     eprintln!("ssh test -f {}:{}", user_host, remote_path);
-    let output = Command::new("ssh")
-        .args(ssh_base_args())
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_base_args() {
+        cmd.arg(arg);
+    }
+    let output = cmd
         .arg(user_host)
         .arg("test")
         .arg("-f")
@@ -658,19 +667,36 @@ fn file_name_from_str_path(path: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
 }
 
-fn ssh_base_args() -> [&'static str; 12] {
-    [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-        "-p",
-        "58022",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        "ControlPersist=30s",
-        "-o",
-        "ControlPath=~/.ssh/zapvis-%r@%h:%p",
-    ]
+fn ssh_base_args() -> Vec<String> {
+    let mut args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=5".to_string(),
+        "-p".to_string(),
+        "58022".to_string(),
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        "ControlPersist=30s".to_string(),
+        "-o".to_string(),
+    ];
+    
+    // Build ControlPath: use temp dir on Windows, ~/.ssh on Unix
+    let control_path = if cfg!(windows) {
+        if let Ok(temp) = std::env::var("TEMP") {
+            format!("{}\\zapvis-%r@%h_%p", temp)
+        } else {
+            "zapvis-%r@%h_%p".to_string()
+        }
+    } else {
+        if let Ok(home) = std::env::var("HOME") {
+            format!("{}/.ssh/zapvis-%r@%h:%p", home)
+        } else {
+            "/tmp/zapvis-%r@%h:%p".to_string()
+        }
+    };
+    
+    args.push(format!("ControlPath={}", control_path));
+    args
 }
