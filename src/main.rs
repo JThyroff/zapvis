@@ -35,15 +35,23 @@ fn spawn_remote_worker(ssh: PersistentSsh) -> Sender<RemoteWorkerRequest> {
         while let Ok(req) = rx.recv() {
             match req {
                 RemoteWorkerRequest::Exists { path, response_tx } => {
+                    eprintln!("[SSH worker] executing: exists {}", path);
                     let result = ssh.exists(&path);
                     let _ = response_tx.send(result);
                 }
                 RemoteWorkerRequest::Cat { path, response_tx } => {
+                    eprintln!("[SSH worker] executing: cat {}", path);
                     let result = ssh.cat(&path);
+                    if let Ok(ref bytes) = result {
+                        eprintln!("[SSH worker] cat result: {} bytes", bytes.len());
+                    } else {
+                        eprintln!("[SSH worker] cat error");
+                    }
                     let _ = response_tx.send(result);
                 }
             }
         }
+        eprintln!("[SSH worker] exiting");
     });
     
     tx
@@ -140,7 +148,10 @@ fn main() -> Result<()> {
     let remote_worker_tx = match &input_spec.source {
         SequenceSource::Remote { user_host, .. } => {
             match PersistentSsh::connect(user_host) {
-                Ok(ssh) => Some(spawn_remote_worker(ssh)),
+                Ok(ssh) => {
+                    eprintln!("[SSH] Connected to {}", user_host);
+                    Some(spawn_remote_worker(ssh))
+                }
                 Err(e) => {
                     eprintln!("Failed to establish persistent SSH: {}", e);
                     None
@@ -220,6 +231,7 @@ impl SequenceSpec {
                 let remote_path = build_remote_path(dir, &self.file_name_for(idx));
                 if let Some(tx) = request_tx {
                     let (response_tx, response_rx) = channel();
+                    eprintln!("[SSH] exists: {}", remote_path);
                     tx.send(RemoteWorkerRequest::Exists {
                         path: remote_path,
                         response_tx,
@@ -402,11 +414,13 @@ impl ImageCache {
                             let remote_path = build_remote_path(dir, &req.file_name);
                             if let Some(tx) = &req.request_tx {
                                 let (response_tx, response_rx) = channel();
+                                eprintln!("[SSH] cat: {} (idx={})", remote_path, req.idx);
                                 tx.send(RemoteWorkerRequest::Cat {
                                     path: remote_path.clone(),
                                     response_tx,
                                 }).context("Failed to send CAT request")?;
                                 let bytes = response_rx.recv().context("remote worker hung up")??;
+                                eprintln!("[SSH] cat received {} bytes (idx={})", bytes.len(), req.idx);
                                 load_image_rgba_from_bytes(&bytes, &format!("{}:{}", user_host, remote_path))
                             } else {
                                 Err(anyhow!("SSH connection not available for background loading"))
@@ -444,7 +458,9 @@ impl ImageCache {
         while let Ok((idx, rgba_image)) = self.result_rx.try_recv() {
             // Only insert if this idx is still pending (i.e., not evicted out-of-range)
             if self.pending_loads.remove(&idx) {
+                let (w, h) = (rgba_image.width(), rgba_image.height());
                 if let Ok(tex) = rgba_to_texture(ctx, idx, rgba_image) {
+                    eprintln!("[Cache] loaded idx={} ({}x{})", idx, w, h);
                     self.cache.insert(idx, tex);
                     converted += 1;
                 }
@@ -476,6 +492,9 @@ impl ImageCache {
             .collect();
         
         let evicted_count = to_evict.len();
+        if evicted_count > 0 {
+            eprintln!("[Cache] evicted {} entries", evicted_count);
+        }
         for idx in to_evict {
             self.cache.remove(&idx);
         }
@@ -522,6 +541,19 @@ impl ImageCache {
 
     fn is_pending(&self, idx: u64) -> bool {
         self.pending_loads.contains(&idx)
+    }
+}
+
+impl Drop for ImageCache {
+    fn drop(&mut self) {
+        // Clear pending loads and close loader channel
+        let pending_count = self.pending_loads.len();
+        if pending_count > 0 {
+            eprintln!("[Loader] cancelling {} pending loads", pending_count);
+        }
+        self.pending_loads.clear();
+        eprintln!("[Loader] exiting");
+        // Dropping load_request_tx will cause loader thread to exit
     }
 }
 
@@ -591,12 +623,14 @@ impl ZapVisApp {
             return;
         }
         let next_u = next as u64;
+        eprintln!("[Step] navigating from {} to {}", cur, next_u);
         
         // For local files, check existence first (fast, non-blocking)
         if let SequenceSource::Local(dir) = &self.seq.source {
             if !dir.join(self.seq.file_name_for(next_u)).exists() {
                 let p = self.seq.path_display(next_u);
                 self.status = format!("No file: {} | {}", p, self.cache.cache_info());
+                eprintln!("[Step] file not found: {}", p);
                 return;
             }
         }
@@ -646,8 +680,9 @@ impl eframe::App for ZapVisApp {
             }
         });
 
-        // Allow ESC to quit
+        // Allow ESC to quit (closes SSH connection and stops all pending image loads)
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            eprintln!("[UI] ESC pressed, closing application");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
