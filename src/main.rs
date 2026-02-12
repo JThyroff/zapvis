@@ -6,7 +6,7 @@ mod image_util;
 mod remote_worker;
 mod sequence;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use std::fs;
 use crate::app::ZapVisApp;
