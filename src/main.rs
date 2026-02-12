@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -53,18 +54,44 @@ fn main() -> Result<()> {
     }
 
     // Input is required if not showing config
-    let input = args.input.ok_or_else(|| anyhow!("Input file is required (unless using --config flag)"))?;
-    if !input.is_file() {
-        return Err(anyhow!(
-            "Input must be an image FILE path. Folder mode is intentionally not supported."
-        ));
-    }
+    let input = args
+        .input
+        .ok_or_else(|| anyhow!("Input file is required (unless using --config flag)"))?;
+    let input_str = input.to_string_lossy();
+    let input_spec = if let Some((user_host, remote_path)) = parse_remote_input(&input_str) {
+        ensure_ssh_auth(&user_host)?;
+        let file_name = file_name_from_str_path(&remote_path)?;
+        let dir = Path::new(&remote_path)
+            .parent()
+            .ok_or_else(|| anyhow!("Remote input has no parent directory"))?
+            .to_string_lossy()
+            .to_string();
+        InputSpec {
+            file_name,
+            source: SequenceSource::Remote { user_host, dir },
+        }
+    } else {
+        if !input.is_file() {
+            return Err(anyhow!(
+                "Input must be an image FILE path. Folder mode is intentionally not supported."
+            ));
+        }
+        let file_name = file_name_from_path(&input)?;
+        let dir = input
+            .parent()
+            .ok_or_else(|| anyhow!("Input has no parent directory"))?
+            .to_path_buf();
+        InputSpec {
+            file_name,
+            source: SequenceSource::Local(dir),
+        }
+    };
 
     let mut cfg = load_config().unwrap_or_default();
 
     // If user provided --pattern, try it first and store it if it works.
     if let Some(pat) = args.pattern.clone() {
-        if pattern_matches_file(&pat, &input)? {
+        if pattern_matches_file(&pat, &input_spec.file_name)? {
             maybe_add_pattern(&mut cfg, pat);
             save_config(&cfg).ok(); // ignore save errors (still can run)
         } else {
@@ -75,7 +102,7 @@ fn main() -> Result<()> {
     }
 
     // Determine which pattern to use:
-    let (pattern, seq) = match pick_sequence(&cfg, &input) {
+    let (pattern, seq) = match pick_sequence(&cfg, &input_spec) {
         Ok(v) => v,
         Err(e) => {
             // Your rule: if no hits, quit. (No interactive prompt here.)
@@ -102,18 +129,60 @@ fn main() -> Result<()> {
 
 /// Represents a compiled sequence extracted from a filename pattern and a concrete file.
 #[derive(Debug, Clone)]
+#[derive(Debug, Clone)]
+enum SequenceSource {
+    Local(PathBuf),
+    Remote { user_host: String, dir: String },
+}
+
+#[derive(Debug, Clone)]
 struct SequenceSpec {
-    dir: PathBuf,
+    source: SequenceSource,
     prefix: String,
     width: usize,
     suffix: String,
     index: u64,
 }
 
+#[derive(Debug, Clone)]
+struct InputSpec {
+    file_name: String,
+    source: SequenceSource,
+}
+
 impl SequenceSpec {
-    fn path_for(&self, idx: u64) -> PathBuf {
-        let name = format!("{}{:0width$}{}", self.prefix, idx, self.suffix, width = self.width);
-        self.dir.join(name)
+    fn file_name_for(&self, idx: u64) -> String {
+        format!("{}{:0width$}{}", self.prefix, idx, self.suffix, width = self.width)
+    }
+
+    fn path_display(&self, idx: u64) -> String {
+        match &self.source {
+            SequenceSource::Local(dir) => dir.join(self.file_name_for(idx)).display().to_string(),
+            SequenceSource::Remote { user_host, dir } => {
+                let remote_path = build_remote_path(dir, &self.file_name_for(idx));
+                format!("{}:{}", user_host, remote_path)
+            }
+        }
+    }
+
+    fn exists(&self, idx: u64) -> Result<bool> {
+        match &self.source {
+            SequenceSource::Local(dir) => Ok(dir.join(self.file_name_for(idx)).exists()),
+            SequenceSource::Remote { user_host, dir } => {
+                let remote_path = build_remote_path(dir, &self.file_name_for(idx));
+                ssh_test_file(user_host, &remote_path)
+            }
+        }
+    }
+
+    fn load_rgba(&self, idx: u64) -> Result<RgbaImage> {
+        match &self.source {
+            SequenceSource::Local(dir) => load_image_rgba(&dir.join(self.file_name_for(idx))),
+            SequenceSource::Remote { user_host, dir } => {
+                let remote_path = build_remote_path(dir, &self.file_name_for(idx));
+                load_image_rgba_remote(user_host, &remote_path)
+            }
+        }
     }
 }
 
@@ -195,34 +264,21 @@ fn maybe_add_pattern(cfg: &mut Config, pat: String) {
     }
 }
 
-fn pattern_matches_file(pat: &str, file: &Path) -> Result<bool> {
-    let file_name = file
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))?;
-
+fn pattern_matches_file(pat: &str, file_name: &str) -> Result<bool> {
     let (re, _, _, _) = compile_pattern(pat)?;
     Ok(re.is_match(file_name))
 }
 
 /// Try patterns from config; return first that matches AND has neighbor evidence.
 /// Evidence: current file matches and at least one neighbor exists (idx±1).
-fn pick_sequence(cfg: &Config, input: &Path) -> Result<(String, SequenceSpec)> {
+fn pick_sequence(cfg: &Config, input: &InputSpec) -> Result<(String, SequenceSpec)> {
     // If config empty, fail quickly.
     if cfg.patterns.is_empty() {
         return Err(anyhow!("No patterns configured."));
     }
 
-    let file_name = input
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))?
-        .to_string();
-
-    let dir = input
-        .parent()
-        .ok_or_else(|| anyhow!("Input has no parent directory"))?
-        .to_path_buf();
+    let file_name = input.file_name.clone();
+    let source = input.source.clone();
 
     for pat in &cfg.patterns {
         let (re, prefix, width, suffix) = compile_pattern(pat)?;
@@ -231,7 +287,7 @@ fn pick_sequence(cfg: &Config, input: &Path) -> Result<(String, SequenceSpec)> {
             let idx: u64 = idx_str.parse().context("Failed to parse captured index")?;
 
             let spec = SequenceSpec {
-                dir: dir.clone(),
+                source: source.clone(),
                 prefix,
                 width,
                 suffix,
@@ -239,8 +295,8 @@ fn pick_sequence(cfg: &Config, input: &Path) -> Result<(String, SequenceSpec)> {
             };
 
             // Neighbor evidence via stat(): cheap and avoids enumeration.
-            let has_next = spec.path_for(idx + 1).exists();
-            let has_prev = idx > 0 && spec.path_for(idx - 1).exists();
+            let has_next = spec.exists(idx + 1).unwrap_or(false);
+            let has_prev = idx > 0 && spec.exists(idx - 1).unwrap_or(false);
 
             if has_next || has_prev {
                 return Ok((pat.clone(), spec));
@@ -329,18 +385,17 @@ impl ImageCache {
         let mut launched_count = 0;
         for idx in min_idx..=max_idx {
             if !self.cache.contains_key(&idx) && !self.pending_loads.contains(&idx) {
-                let path = seq.path_for(idx);
-                if path.exists() {
-                    self.pending_loads.insert(idx);
-                    let tx = self.tx.clone();
-                    let path_clone = path.clone();
-                    thread::spawn(move || {
-                        if let Ok(rgba) = load_image_rgba(&path_clone) {
-                            let _ = tx.send((idx, rgba));
-                        }
-                    });
-                    launched_count += 1;
-                }
+                    if seq.exists(idx).unwrap_or(false) {
+                        self.pending_loads.insert(idx);
+                        let tx = self.tx.clone();
+                        let seq_clone = seq.clone();
+                        thread::spawn(move || {
+                            if let Ok(rgba) = seq_clone.load_rgba(idx) {
+                                let _ = tx.send((idx, rgba));
+                            }
+                        });
+                        launched_count += 1;
+                    }
             }
         }
 
@@ -377,11 +432,11 @@ impl ZapVisApp {
     fn update_cache_and_status(&mut self, ctx: &egui::Context) {
         let (loaded, evicted) = self.cache.update_for_index(self.seq.index, &self.seq, ctx);
         
-        let path = self.seq.path_for(self.seq.index);
+        let path = self.seq.path_display(self.seq.index);
         if self.cache.get(self.seq.index).is_some() {
             self.status = format!(
                 "{}  (pattern: {})  |  {} | +{} -{}",
-                path.display(),
+                path,
                 self.pattern,
                 self.cache.cache_info(),
                 loaded,
@@ -389,7 +444,7 @@ impl ZapVisApp {
             );
         } else {
             self.status = format!("Failed to load {} | {} | +{} -{}", 
-                path.display(), 
+                path, 
                 self.cache.cache_info(), 
                 loaded, 
                 evicted
@@ -404,13 +459,19 @@ impl ZapVisApp {
             return;
         }
         let next_u = next as u64;
-        let p = self.seq.path_for(next_u);
-        if p.exists() {
-            self.seq.index = next_u;
-            self.update_cache_and_status(ctx);
-        } else {
-            // strict: don't scan; just stop
-            self.status = format!("No file: {} | {}", p.display(), self.cache.cache_info());
+        let p = self.seq.path_display(next_u);
+        match self.seq.exists(next_u) {
+            Ok(true) => {
+                self.seq.index = next_u;
+                self.update_cache_and_status(ctx);
+            }
+            Ok(false) => {
+                // strict: don't scan; just stop
+                self.status = format!("No file: {} | {}", p, self.cache.cache_info());
+            }
+            Err(e) => {
+                self.status = format!("Error checking {}: {}", p, e);
+            }
         }
     }
 }
@@ -467,6 +528,39 @@ fn load_image_rgba(path: &Path) -> Result<RgbaImage> {
     Ok(img.to_rgba8())
 }
 
+fn load_image_rgba_remote(user_host: &str, remote_path: &str) -> Result<RgbaImage> {
+    let output = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            user_host,
+            "cat",
+            remote_path,
+        ])
+        .output()
+        .with_context(|| format!("ssh cat failed for {}:{}", user_host, remote_path))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "ssh cat failed for {}:{}: {}",
+            user_host,
+            remote_path,
+            stderr.trim()
+        ));
+    }
+
+    load_image_rgba_from_bytes(&output.stdout, &format!("{}:{}", user_host, remote_path))
+}
+
+fn load_image_rgba_from_bytes(bytes: &[u8], source: &str) -> Result<RgbaImage> {
+    let img = image::load_from_memory(bytes)
+        .with_context(|| format!("image::load_from_memory failed for {}", source))?;
+    Ok(img.to_rgba8())
+}
+
 /// Convert RgbaImage to egui TextureHandle (must be done on main thread with Context)
 fn rgba_to_texture(ctx: &egui::Context, rgba: RgbaImage) -> Result<TextureHandle> {
     let (w, h) = rgba.dimensions();
@@ -477,4 +571,89 @@ fn rgba_to_texture(ctx: &egui::Context, rgba: RgbaImage) -> Result<TextureHandle
         color_image,
         egui::TextureOptions::LINEAR,
     ))
+}
+
+fn parse_remote_input(input: &str) -> Option<(String, String)> {
+    let re = Regex::new(r"^([^@]+@[^:]+):(/.+)$").ok()?;
+    let caps = re.captures(input)?;
+    Some((caps.get(1)?.as_str().to_string(), caps.get(2)?.as_str().to_string()))
+}
+
+fn ensure_ssh_auth(user_host: &str) -> Result<()> {
+    let status = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            user_host,
+            "true",
+        ])
+        .status()
+        .with_context(|| format!("ssh auth check failed for {}", user_host))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "SSH auth not available for {}. Configure keys/agent before using remote paths.",
+            user_host
+        ))
+    }
+}
+
+fn ssh_test_file(user_host: &str, remote_path: &str) -> Result<bool> {
+    let output = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            user_host,
+            "test",
+            "-f",
+            remote_path,
+        ])
+        .output()
+        .with_context(|| format!("ssh test failed for {}:{}", user_host, remote_path))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "ssh test failed for {}:{}: {}",
+        user_host,
+        remote_path,
+        stderr.trim()
+    ))
+}
+
+fn build_remote_path(dir: &str, file_name: &str) -> String {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        format!("/{}", file_name)
+    } else {
+        format!("{}/{}", trimmed, file_name)
+    }
+}
+
+fn file_name_from_path(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
+}
+
+fn file_name_from_str_path(path: &str) -> Result<String> {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
 }
