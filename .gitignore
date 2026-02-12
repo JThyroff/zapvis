@@ -29,5 +29,5 @@ Thumbs.db
 .egui/
 
 # --- User config / runtime data ---
-# zapviz stores user patterns here; do NOT commit
+# zapvis stores user patterns here; do NOT commit
 **/config.toml

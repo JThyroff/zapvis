@@ -9,18 +9,22 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// zapviz: sequence-only image viewer.
+/// zapvis: sequence-only image viewer.
 /// Opens a file, matches it against configured patterns with # as digit placeholders,
 /// then navigates by changing the numeric id and stat()'ing the constructed filename.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
     /// Image file to open (recommended). Folder mode is intentionally not supported.
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     /// Optional pattern override, e.g. "########_#.png"
     #[arg(long)]
     pattern: Option<String>,
+
+    /// Show config file path and content, then exit
+    #[arg(short, long)]
+    config: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -31,7 +35,22 @@ struct Config {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let input = args.input;
+    // Handle --config flag
+    if args.config {
+        let path = config_path()?;
+        println!("Config path: {}", path.display());
+        if path.exists() {
+            let content = fs::read_to_string(&path)
+                .context("Failed to read config file")?;
+            println!("\nConfig content:\n{}", content);
+        } else {
+            println!("Config file does not exist.");
+        }
+        return Ok(());
+    }
+
+    // Input is required if not showing config
+    let input = args.input.ok_or_else(|| anyhow!("Input file is required (unless using --config flag)"))?;
     if !input.is_file() {
         return Err(anyhow!(
             "Input must be an image FILE path. Folder mode is intentionally not supported."
@@ -69,9 +88,9 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "zapviz",
+        "zapvis",
         native_options,
-        Box::new(|cc| Ok(Box::new(ZapVizApp::new(cc, pattern, seq)))),
+        Box::new(|cc| Ok(Box::new(ZapVisApp::new(cc, pattern, seq)))),
     )
     .map_err(|e| anyhow!(e.to_string()))?;
 
@@ -162,7 +181,7 @@ fn save_config(cfg: &Config) -> Result<()> {
 }
 
 fn config_path() -> Result<PathBuf> {
-    let proj = ProjectDirs::from("dev", "zapviz", "zapviz")
+    let proj = ProjectDirs::from("dev", "zapvis", "zapvis")
         .ok_or_else(|| anyhow!("Could not determine config directory"))?;
     Ok(proj.config_dir().join("config.toml"))
 }
@@ -231,7 +250,7 @@ fn pick_sequence(cfg: &Config, input: &Path) -> Result<(String, SequenceSpec)> {
 
 // ---------------- GUI app ----------------
 
-struct ZapVizApp {
+struct ZapVisApp {
     pattern: String,
     seq: SequenceSpec,
 
@@ -239,7 +258,7 @@ struct ZapVizApp {
     status: String,
 }
 
-impl ZapVizApp {
+impl ZapVisApp {
     fn new(_cc: &eframe::CreationContext<'_>, pattern: String, seq: SequenceSpec) -> Self {
         Self {
             pattern,
@@ -281,7 +300,7 @@ impl ZapVizApp {
     }
 }
 
-impl eframe::App for ZapVizApp {
+impl eframe::App for ZapVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Load initial image once
         if self.texture.is_none() && self.status.is_empty() {
@@ -299,7 +318,7 @@ impl eframe::App for ZapVizApp {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.label(&self.status);
-            ui.label("Keys: ←/→ or A/D. Esc closes the window.");
+            ui.label("Keys: Left/Right or A/D. Esc closes the window.");
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -331,7 +350,7 @@ fn load_image_to_texture(ctx: &egui::Context, path: &Path) -> Result<TextureHand
 
     let color_image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
     Ok(ctx.load_texture(
-        "zapviz_image",
+        "zapvis_image",
         color_image,
         egui::TextureOptions::LINEAR,
     ))
