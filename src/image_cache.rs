@@ -18,9 +18,12 @@ struct LoadRequest {
     request_tx: Option<Sender<RemoteWorkerRequest>>,
 }
 
-/// Bidirectional image cache with configurable radius.
-/// Maintains textures for indices in range [current - radius, current + radius].
-/// Uses a single background loader thread with a queue for image decoding.
+/// Bidirectional image cache with lazy sliding window.
+/// Implements a hysteresis-based cache window with step-size adaptation:
+/// - Window size: configured radius before and after current index (multiplied by step_size)
+/// - Reload threshold: Only recalculate window when index moves beyond threshold from center
+/// - Step-size support: Cache adapts to user navigation patterns (1, 10, 100, etc.)
+/// This reduces unnecessary reloads during back-and-forth navigation.
 pub struct ImageCache {
     cache: BTreeMap<u64, TextureHandle>,
     cache_radius: usize,
@@ -31,7 +34,13 @@ pub struct ImageCache {
     seq_source: SequenceSource,
     request_tx: Option<Sender<RemoteWorkerRequest>>,
     remote_range: Option<RemoteRange>,
+    /// Center of the current cache window (for hysteresis logic)
+    window_center: Option<u64>,
 }
+
+/// Threshold for triggering cache window recalculation.
+/// Window is only recalculated when current index moves more than this distance from center.
+const RELOAD_THRESHOLD: u64 = 10;
 
 impl ImageCache {
     pub fn new(
@@ -88,6 +97,7 @@ impl ImageCache {
             seq_source,
             request_tx,
             remote_range,
+            window_center: None,
         }
     }
 
@@ -128,7 +138,26 @@ impl ImageCache {
         converted
     }
 
-    /// Update cache centered on new_index, preloading neighbors and evicting out-of-range entries
+    /// Update cache centered on new_index, preloading neighbors and evicting out-of-range entries.
+    /// Uses a lazy sliding window with hysteresis and step-size adaptation:
+    /// - Window is only recalculated when new_index moves more than RELOAD_THRESHOLD from center
+    /// - Cache indices use step_size multiplier for sparse navigation patterns
+    /// - This avoids unnecessary reloads during back-and-forth navigation
+    ///
+    /// # Behavior
+    /// 
+    /// Window size is determined by cache_radius * step_size (e.g., radius=20, step=10 means 200 images).
+    /// 
+    /// The window center is only updated when the current index moves more than 
+    /// RELOAD_THRESHOLD positions away from the center. This creates a "dead zone" 
+    /// where navigation doesn't trigger cache reloads.
+    /// 
+    /// Example with radius=20, threshold=10, step=1:
+    /// - Initial load at index 50: Window is [30, 70], center = 50
+    /// - Navigate to 55: No reload (distance = 5, within threshold)
+    /// - Navigate to 45: No reload (distance = 5, within threshold)  
+    /// - Navigate to 61: Reload triggered (distance = 11 > threshold)
+    ///   New window [41, 81], center = 61
     pub fn update_for_index(
         &mut self,
         new_index: u64,
@@ -137,6 +166,29 @@ impl ImageCache {
     ) -> (usize, usize) {
         // First, process any decoded images waiting to become textures
         self.process_decoded_images(ctx);
+        
+        // Determine if we need to recalculate the window
+        let needs_recalc = match self.window_center {
+            None => true, // First time, always calculate
+            Some(center) => {
+                // Check if current index has moved more than RELOAD_THRESHOLD from center
+                let distance = if new_index > center {
+                    new_index - center
+                } else {
+                    center - new_index
+                };
+                distance > RELOAD_THRESHOLD
+            }
+        };
+
+        if !needs_recalc {
+            // Within the inner window - just process decoded images, no reload
+            return (0, 0);
+        }
+
+        // Update window center to new index
+        self.window_center = Some(new_index);
+        eprintln!("[Cache] window center updated to {}", new_index);
 
         let radius = self.cache_radius as u64;
         let step = self.step_size;
@@ -229,6 +281,59 @@ impl ImageCache {
 
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
+    }
+
+    /// For testing: get the current window center
+    #[cfg(test)]
+    pub fn window_center(&self) -> Option<u64> {
+        self.window_center
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RELOAD_THRESHOLD;
+    
+    fn calculate_distance(center: u64, new_index: u64) -> u64 {
+        if new_index > center {
+            new_index - center
+        } else {
+            center - new_index
+        }
+    }
+
+    #[test]
+    fn test_hysteresis_threshold() {
+        // Test the hysteresis logic without requiring full ImageCache setup
+        
+        // Case 1: No center set, should always need recalc
+        let window_center: Option<u64> = None;
+        assert!(window_center.is_none(), "First load should have no center");
+        
+        // Case 2: Within threshold - no recalc needed
+        let window_center = Some(50);
+        let new_index = 55;
+        let distance = calculate_distance(window_center.unwrap(), new_index);
+        assert_eq!(distance, 5);
+        assert!(distance <= RELOAD_THRESHOLD, "Distance 5 should be within threshold");
+        
+        // Case 3: At threshold - no recalc needed
+        let new_index = 60;
+        let distance = calculate_distance(window_center.unwrap(), new_index);
+        assert_eq!(distance, 10);
+        assert!(distance <= RELOAD_THRESHOLD, "Distance 10 should be at threshold");
+        
+        // Case 4: Beyond threshold - recalc needed
+        let new_index = 61;
+        let distance = calculate_distance(window_center.unwrap(), new_index);
+        assert_eq!(distance, 11);
+        assert!(distance > RELOAD_THRESHOLD, "Distance 11 should exceed threshold");
+        
+        // Case 5: Backwards beyond threshold
+        let new_index = 39;
+        let distance = calculate_distance(window_center.unwrap(), new_index);
+        assert_eq!(distance, 11);
+        assert!(distance > RELOAD_THRESHOLD, "Distance -11 should exceed threshold");
     }
 }
 

@@ -25,7 +25,7 @@ impl ZapVisApp {
             SequenceSource::Remote { .. } => Some(remote_range),
             SequenceSource::Local(_) => None,
         };
-        let cache = ImageCache::new(10, seq.source.clone(), request_tx, cache_remote_range);
+        let cache = ImageCache::new(20, seq.source.clone(), request_tx, cache_remote_range);
 
         Self {
             pattern,
