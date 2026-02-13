@@ -170,8 +170,10 @@ impl ImageCache {
         self.pending_loads.retain(|&idx| idx >= min_idx && idx <= max_idx);
 
         // Generate indices to load using symmetric centered order
-        // i-s, i+s, i-2s, i+2s, i-3s, i+3s, ...
+        // Start with current index for immediate visual feedback on startup
+        // Order: current, i-s, i+s, i-2s, i+2s, i-3s, i+3s, ...
         let mut indices_to_check = Vec::new();
+        indices_to_check.push(new_index);
         for offset in 1..=radius {
             // Add backward index (i - offset*step)
             if let Some(back_idx) = new_index.checked_sub(offset * step) {
