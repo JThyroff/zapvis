@@ -31,6 +31,7 @@ pub struct ImageCache {
     seq_source: SequenceSource,
     request_tx: Option<Sender<RemoteWorkerRequest>>,
     remote_range: Option<RemoteRange>,
+    startup_phase: bool,
 }
 
 impl ImageCache {
@@ -88,12 +89,58 @@ impl ImageCache {
             seq_source,
             request_tx,
             remote_range,
+            startup_phase: true,
         }
     }
 
     /// Get texture for specific index if cached
     pub fn get(&self, idx: u64) -> Option<&TextureHandle> {
         self.cache.get(&idx)
+    }
+
+    /// Load only the target image (Phase 1 - startup fast path)
+    /// This method loads just the requested index without checking or loading neighbors
+    pub fn load_target_only(&mut self, target_idx: u64, seq: &SequenceSpec) {
+        // Skip if already cached or pending
+        if self.cache.contains_key(&target_idx) || self.pending_loads.contains(&target_idx) {
+            return;
+        }
+
+        eprintln!("[Cache] Phase 1: loading target image at idx={}", target_idx);
+        
+        // Mark as pending
+        self.pending_loads.insert(target_idx);
+        
+        // Request load for just this one image
+        let file_name = format!("{}{:0width$}{}", seq.prefix, target_idx, seq.suffix, width = seq.width);
+        let req = LoadRequest {
+            idx: target_idx,
+            file_name,
+            seq_source: self.seq_source.clone(),
+            request_tx: self.request_tx.clone(),
+        };
+        let _ = self.load_request_tx.send(req);
+    }
+
+    /// Mark that the startup phase is complete and normal caching can begin
+    pub fn complete_startup_phase(&mut self) {
+        if self.startup_phase {
+            eprintln!("[Cache] Phase 2: startup complete, beginning neighbor preload");
+            self.startup_phase = false;
+        }
+    }
+
+    /// Check if cache is still in startup phase.
+    /// 
+    /// During startup phase, only the target image is loaded without neighbor preloading.
+    /// Once the target image is available, the cache transitions to normal operation mode.
+    /// 
+    /// # Returns
+    /// 
+    /// `true` if the cache is in startup phase (before target image loads),
+    /// `false` if the cache has completed startup and is in normal operation mode.
+    pub fn is_startup_phase(&self) -> bool {
+        self.startup_phase
     }
 
     /// Clear cache except for the current index and set new step size
@@ -137,6 +184,11 @@ impl ImageCache {
     ) -> (usize, usize) {
         // First, process any decoded images waiting to become textures
         self.process_decoded_images(ctx);
+
+        // If in startup phase, don't load neighbors yet - wait for target to appear
+        if self.startup_phase {
+            return (0, 0);
+        }
 
         let radius = self.cache_radius as u64;
         let step = self.step_size;
@@ -247,5 +299,42 @@ impl Drop for ImageCache {
         self.pending_loads.clear();
         eprintln!("[Loader] exiting");
         // Dropping load_request_tx will cause loader thread to exit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_startup_phase_flag() {
+        let cache = ImageCache::new(
+            10,
+            SequenceSource::Local(PathBuf::from("/tmp")),
+            None,
+            None,
+        );
+        
+        // Should start in startup phase
+        assert!(cache.is_startup_phase());
+    }
+
+    #[test]
+    fn test_complete_startup_phase() {
+        let mut cache = ImageCache::new(
+            10,
+            SequenceSource::Local(PathBuf::from("/tmp")),
+            None,
+            None,
+        );
+        
+        assert!(cache.is_startup_phase());
+        
+        // Complete startup phase
+        cache.complete_startup_phase();
+        
+        // Should no longer be in startup phase
+        assert!(!cache.is_startup_phase());
     }
 }

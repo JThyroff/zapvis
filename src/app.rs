@@ -119,8 +119,17 @@ impl eframe::App for ZapVisApp {
         // Process any decoded images from background threads
         self.cache.tick(ctx);
 
-        // Load initial cache once
-        if self.cache.is_empty() && self.status.is_empty() {
+        // Phase 1: On first frame, load only the target image (fast path)
+        if self.cache.is_startup_phase() && self.cache.is_empty() && self.status.is_empty() {
+            eprintln!("[App] Starting Phase 1: loading target image");
+            self.cache.load_target_only(self.seq.index, &self.seq);
+            self.update_cache_and_status(ctx);
+        }
+
+        // Phase 2: Once target image appears, complete startup and start neighbor preloading
+        if self.cache.is_startup_phase() && self.cache.get(self.seq.index).is_some() {
+            eprintln!("[App] Target image loaded, starting Phase 2: neighbor preload");
+            self.cache.complete_startup_phase();
             self.update_cache_and_status(ctx);
         }
 
