@@ -175,7 +175,9 @@ impl ImageCache {
         for offset in 1..=radius {
             // Add backward index (i - offset*step)
             if let Some(back_idx) = new_index.checked_sub(offset * step) {
-                indices_to_check.push(back_idx);
+                if back_idx >= min_idx {
+                    indices_to_check.push(back_idx);
+                }
             }
             // Add forward index (i + offset*step)
             let forward_idx = new_index.saturating_add(offset * step);
