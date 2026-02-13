@@ -130,7 +130,15 @@ impl ImageCache {
         }
     }
 
-    /// Check if still in startup phase
+    /// Check if cache is still in startup phase.
+    /// 
+    /// During startup phase, only the target image is loaded without neighbor preloading.
+    /// Once the target image is available, the cache transitions to normal operation mode.
+    /// 
+    /// # Returns
+    /// 
+    /// `true` if the cache is in startup phase (before target image loads),
+    /// `false` if the cache has completed startup and is in normal operation mode.
     pub fn is_startup_phase(&self) -> bool {
         self.startup_phase
     }
