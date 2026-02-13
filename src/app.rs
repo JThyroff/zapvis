@@ -10,6 +10,7 @@ pub struct ZapVisApp {
     seq: SequenceSpec,
     cache: ImageCache,
     status: String,
+    step_size: u64,
 }
 
 impl ZapVisApp {
@@ -31,6 +32,7 @@ impl ZapVisApp {
             seq,
             cache,
             status: String::new(),
+            step_size: 1,
         }
     }
 
@@ -43,40 +45,44 @@ impl ZapVisApp {
         if self.cache.get(idx).is_some() {
             // Image is cached and ready
             self.status = format!(
-                "{}  (pattern: {})  |  {} | +{} -{}",
+                "{}  (pattern: {})  |  {} | +{} -{} | step: {}",
                 path,
                 self.pattern,
                 self.cache.cache_info(),
                 loaded,
-                evicted
+                evicted,
+                self.step_size
             );
         } else if self.cache.is_pending(idx) {
             // Image is being loaded
             self.status = format!(
-                "Loading {} | {}",
+                "Loading {} | {} | step: {}",
                 path,
-                self.cache.cache_info()
+                self.cache.cache_info(),
+                self.step_size
             );
         } else {
             // Image not found or failed to load
             self.status = format!(
-                "Not found / failed: {} | {} | +{} -{}",
+                "Not found / failed: {} | {} | +{} -{} | step: {}",
                 path,
                 self.cache.cache_info(),
                 loaded,
-                evicted
+                evicted,
+                self.step_size
             );
         }
     }
 
     fn try_step(&mut self, ctx: &egui::Context, delta: i64) {
         let cur = self.seq.index as i64;
-        let next = cur + delta;
+        let step = self.step_size as i64;
+        let next = cur + delta * step;
         if next < 0 {
             return;
         }
         let next_u = next as u64;
-        eprintln!("[Step] navigating from {} to {}", cur, next_u);
+        eprintln!("[Step] navigating from {} to {} (step={})", cur, next_u, step);
 
         // For local files, check existence first (fast, non-blocking)
         if let SequenceSource::Local(dir) = &self.seq.source {
@@ -91,6 +97,19 @@ impl ZapVisApp {
         // For remote: proceed optimistically (don't block UI with recv())
         // The cache loader will attempt to fetch and show "Failed to load" if it doesn't exist
         self.seq.index = next_u;
+        self.update_cache_and_status(ctx);
+    }
+
+    fn set_step_size(&mut self, new_step: u64, ctx: &egui::Context) {
+        if new_step == self.step_size {
+            return;
+        }
+        eprintln!("[Step] changing step size from {} to {}", self.step_size, new_step);
+        self.step_size = new_step;
+        
+        // Update cache step size and clear cache except current image
+        self.cache.set_step_size(new_step);
+        self.cache.clear_except_current(self.seq.index);
         self.update_cache_and_status(ctx);
     }
 }
@@ -114,9 +133,41 @@ impl eframe::App for ZapVisApp {
             self.try_step(ctx, -1);
         }
 
+        // Step size selection (keys 0-9 for powers of 10)
+        if input.key_pressed(egui::Key::Num0) {
+            self.set_step_size(1, ctx);
+        }
+        if input.key_pressed(egui::Key::Num1) {
+            self.set_step_size(10, ctx);
+        }
+        if input.key_pressed(egui::Key::Num2) {
+            self.set_step_size(100, ctx);
+        }
+        if input.key_pressed(egui::Key::Num3) {
+            self.set_step_size(1000, ctx);
+        }
+        if input.key_pressed(egui::Key::Num4) {
+            self.set_step_size(10000, ctx);
+        }
+        if input.key_pressed(egui::Key::Num5) {
+            self.set_step_size(100000, ctx);
+        }
+        if input.key_pressed(egui::Key::Num6) {
+            self.set_step_size(1000000, ctx);
+        }
+        if input.key_pressed(egui::Key::Num7) {
+            self.set_step_size(10000000, ctx);
+        }
+        if input.key_pressed(egui::Key::Num8) {
+            self.set_step_size(100000000, ctx);
+        }
+        if input.key_pressed(egui::Key::Num9) {
+            self.set_step_size(1000000000, ctx);
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.label(&self.status);
-            ui.label("Keys: Left/Right or A/D. Esc closes the window.");
+            ui.label("Keys: Left/Right or A/D. 0-9 for step size. Esc closes the window.");
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {

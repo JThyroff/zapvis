@@ -24,6 +24,7 @@ struct LoadRequest {
 pub struct ImageCache {
     cache: BTreeMap<u64, TextureHandle>,
     cache_radius: usize,
+    step_size: u64,
     pending_loads: HashSet<u64>,
     load_request_tx: Sender<LoadRequest>,
     result_rx: Receiver<(u64, RgbaImage)>,
@@ -80,6 +81,7 @@ impl ImageCache {
         Self {
             cache: BTreeMap::new(),
             cache_radius,
+            step_size: 1,
             pending_loads: HashSet::new(),
             load_request_tx,
             result_rx,
@@ -92,6 +94,20 @@ impl ImageCache {
     /// Get texture for specific index if cached
     pub fn get(&self, idx: u64) -> Option<&TextureHandle> {
         self.cache.get(&idx)
+    }
+
+    /// Clear cache except for the current index and set new step size
+    pub fn clear_except_current(&mut self, current_idx: u64) {
+        // Keep only the current index
+        self.cache.retain(|&idx, _| idx == current_idx);
+        // Clear pending loads
+        self.pending_loads.clear();
+        eprintln!("[Cache] cleared except idx={}", current_idx);
+    }
+
+    /// Set the step size for cache filling
+    pub fn set_step_size(&mut self, step: u64) {
+        self.step_size = step;
     }
 
     /// Process any decoded images from background loader thread (convert to textures)
@@ -123,8 +139,11 @@ impl ImageCache {
         self.process_decoded_images(ctx);
 
         let radius = self.cache_radius as u64;
-        let min_idx = new_index.saturating_sub(radius);
-        let max_idx = new_index.saturating_add(radius);
+        let step = self.step_size;
+        
+        // Calculate min/max indices based on step size
+        let min_idx = new_index.saturating_sub(radius * step);
+        let max_idx = new_index.saturating_add(radius * step);
 
         // Update remote range for SSH worker to check
         if let Some(r) = &self.remote_range {
@@ -150,9 +169,26 @@ impl ImageCache {
         // Cancel pending loads outside range
         self.pending_loads.retain(|&idx| idx >= min_idx && idx <= max_idx);
 
-        // Launch background loads for missing entries in range
+        // Generate indices to load using symmetric centered order
+        // i-s, i+s, i-2s, i+2s, i-3s, i+3s, ...
+        let mut indices_to_check = Vec::new();
+        for offset in 1..=radius {
+            // Add backward index (i - offset*step)
+            if let Some(back_idx) = new_index.checked_sub(offset * step) {
+                if back_idx >= min_idx {
+                    indices_to_check.push(back_idx);
+                }
+            }
+            // Add forward index (i + offset*step)
+            let forward_idx = new_index.saturating_add(offset * step);
+            if forward_idx <= max_idx {
+                indices_to_check.push(forward_idx);
+            }
+        }
+
+        // Launch background loads for missing entries
         let mut launched_count = 0;
-        for idx in min_idx..=max_idx {
+        for idx in indices_to_check {
             if !self.cache.contains_key(&idx) && !self.pending_loads.contains(&idx) {
                 // For local files: check existence directly. For remote: always try to load
                 let should_load = match &self.seq_source {
