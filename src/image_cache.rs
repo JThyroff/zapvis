@@ -254,10 +254,19 @@ impl ImageCache {
 
 #[cfg(test)]
 mod tests {
+    use super::RELOAD_THRESHOLD;
+    
+    fn calculate_distance(center: u64, new_index: u64) -> u64 {
+        if new_index > center {
+            new_index - center
+        } else {
+            center - new_index
+        }
+    }
+
     #[test]
     fn test_hysteresis_threshold() {
         // Test the hysteresis logic without requiring full ImageCache setup
-        const RELOAD_THRESHOLD: u64 = 10;
         
         // Case 1: No center set, should always need recalc
         let window_center: Option<u64> = None;
@@ -266,41 +275,25 @@ mod tests {
         // Case 2: Within threshold - no recalc needed
         let window_center = Some(50);
         let new_index = 55;
-        let distance = if new_index > window_center.unwrap() {
-            new_index - window_center.unwrap()
-        } else {
-            window_center.unwrap() - new_index
-        };
+        let distance = calculate_distance(window_center.unwrap(), new_index);
         assert_eq!(distance, 5);
         assert!(distance <= RELOAD_THRESHOLD, "Distance 5 should be within threshold");
         
         // Case 3: At threshold - no recalc needed
         let new_index = 60;
-        let distance = if new_index > window_center.unwrap() {
-            new_index - window_center.unwrap()
-        } else {
-            window_center.unwrap() - new_index
-        };
+        let distance = calculate_distance(window_center.unwrap(), new_index);
         assert_eq!(distance, 10);
         assert!(distance <= RELOAD_THRESHOLD, "Distance 10 should be at threshold");
         
         // Case 4: Beyond threshold - recalc needed
         let new_index = 61;
-        let distance = if new_index > window_center.unwrap() {
-            new_index - window_center.unwrap()
-        } else {
-            window_center.unwrap() - new_index
-        };
+        let distance = calculate_distance(window_center.unwrap(), new_index);
         assert_eq!(distance, 11);
         assert!(distance > RELOAD_THRESHOLD, "Distance 11 should exceed threshold");
         
         // Case 5: Backwards beyond threshold
         let new_index = 39;
-        let distance = if new_index > window_center.unwrap() {
-            new_index - window_center.unwrap()
-        } else {
-            window_center.unwrap() - new_index
-        };
+        let distance = calculate_distance(window_center.unwrap(), new_index);
         assert_eq!(distance, 11);
         assert!(distance > RELOAD_THRESHOLD, "Distance -11 should exceed threshold");
     }
