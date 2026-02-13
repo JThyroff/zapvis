@@ -20,8 +20,8 @@ struct LoadRequest {
 
 /// Bidirectional image cache with lazy sliding window.
 /// Implements a hysteresis-based cache window:
-/// - Window size: 20 images before and after current index (40 total)
-/// - Reload threshold: Only recalculate window when index moves ±10 from center
+/// - Window size: configured radius before and after current index
+/// - Reload threshold: Only recalculate window when index moves beyond threshold from center
 /// This reduces unnecessary reloads during back-and-forth navigation.
 pub struct ImageCache {
     cache: BTreeMap<u64, TextureHandle>,
@@ -35,6 +35,10 @@ pub struct ImageCache {
     /// Center of the current cache window (for hysteresis logic)
     window_center: Option<u64>,
 }
+
+/// Threshold for triggering cache window recalculation.
+/// Window is only recalculated when current index moves more than this distance from center.
+const RELOAD_THRESHOLD: u64 = 10;
 
 impl ImageCache {
     pub fn new(
@@ -119,18 +123,18 @@ impl ImageCache {
 
     /// Update cache centered on new_index, preloading neighbors and evicting out-of-range entries.
     /// Uses a lazy sliding window with hysteresis:
-    /// - Window is only recalculated when new_index moves ±10 from the current window center
+    /// - Window is only recalculated when new_index moves more than RELOAD_THRESHOLD from center
     /// - This avoids unnecessary reloads during back-and-forth navigation
     ///
     /// # Behavior
     /// 
-    /// Window size is 20 images before and after current index (40 images total).
+    /// Window size is determined by cache_radius (e.g., radius=20 means 40 images total).
     /// 
-    /// The window center is only updated when the current index moves more than 10 
-    /// positions away from the center. This creates a "dead zone" where navigation 
-    /// doesn't trigger cache reloads.
+    /// The window center is only updated when the current index moves more than 
+    /// RELOAD_THRESHOLD positions away from the center. This creates a "dead zone" 
+    /// where navigation doesn't trigger cache reloads.
     /// 
-    /// Example:
+    /// Example with radius=20 and threshold=10:
     /// - Initial load at index 50: Window is [30, 70], center = 50
     /// - Navigate to 55: No reload (distance = 5, within threshold)
     /// - Navigate to 45: No reload (distance = 5, within threshold)  
@@ -144,8 +148,6 @@ impl ImageCache {
     ) -> (usize, usize) {
         // First, process any decoded images waiting to become textures
         self.process_decoded_images(ctx);
-
-        const RELOAD_THRESHOLD: u64 = 10;
         
         // Determine if we need to recalculate the window
         let needs_recalc = match self.window_center {
