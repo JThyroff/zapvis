@@ -293,3 +293,40 @@ impl Drop for ImageCache {
         // Dropping load_request_tx will cause loader thread to exit
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_startup_phase_flag() {
+        let cache = ImageCache::new(
+            10,
+            SequenceSource::Local(PathBuf::from("/tmp")),
+            None,
+            None,
+        );
+        
+        // Should start in startup phase
+        assert!(cache.is_startup_phase());
+    }
+
+    #[test]
+    fn test_complete_startup_phase() {
+        let mut cache = ImageCache::new(
+            10,
+            SequenceSource::Local(PathBuf::from("/tmp")),
+            None,
+            None,
+        );
+        
+        assert!(cache.is_startup_phase());
+        
+        // Complete startup phase
+        cache.complete_startup_phase();
+        
+        // Should no longer be in startup phase
+        assert!(!cache.is_startup_phase());
+    }
+}
