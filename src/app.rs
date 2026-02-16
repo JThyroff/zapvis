@@ -11,6 +11,9 @@ pub struct ZapVisApp {
     cache: ImageCache,
     status: String,
     step_size: u64,
+    is_fullscreen: bool,
+    saved_window_pos: Option<egui::Pos2>,
+    saved_window_size: Option<egui::Vec2>,
 }
 
 impl ZapVisApp {
@@ -33,6 +36,9 @@ impl ZapVisApp {
             cache,
             status: String::new(),
             step_size: 1,
+            is_fullscreen: false,
+            saved_window_pos: None,
+            saved_window_size: None,
         }
     }
 
@@ -112,6 +118,42 @@ impl ZapVisApp {
         self.cache.clear_except_current(self.seq.index);
         self.update_cache_and_status(ctx);
     }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        if self.is_fullscreen {
+            // Restore to normal windowed mode
+            eprintln!("[Fullscreen] Restoring to normal windowed mode");
+            
+            // First, un-maximize the window
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            
+            // Then restore previous size and position if available
+            if let Some(size) = self.saved_window_size {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            if let Some(pos) = self.saved_window_pos {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
+            
+            self.is_fullscreen = false;
+        } else {
+            // Enter fullscreen (maximized) mode
+            eprintln!("[Fullscreen] Entering fullscreen mode");
+            
+            // Save current window size and position before maximizing
+            ctx.input(|i| {
+                if let Some(viewport) = i.raw.viewports.get(&i.raw.viewport_id) {
+                    self.saved_window_size = viewport.inner_rect.map(|r| r.size());
+                    self.saved_window_pos = viewport.outer_rect.map(|r| r.min);
+                }
+            });
+            
+            // Maximize the window
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            
+            self.is_fullscreen = true;
+        }
+    }
 }
 
 impl eframe::App for ZapVisApp {
@@ -165,9 +207,14 @@ impl eframe::App for ZapVisApp {
             self.set_step_size(1000000000, ctx);
         }
 
+        // Fullscreen toggle (F key)
+        if input.key_pressed(egui::Key::F) {
+            self.toggle_fullscreen(ctx);
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.label(&self.status);
-            ui.label("Keys: Left/Right or A/D. 0-9 for step size. Esc closes the window.");
+            ui.label("Keys: Left/Right or A/D. 0-9 for step size. F for fullscreen. Esc closes the window.");
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -175,7 +222,13 @@ impl eframe::App for ZapVisApp {
                 let avail = ui.available_size();
 
                 let tex_size = tex.size_vec2();
-                let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y).min(1.0);
+                // In fullscreen mode, allow scaling up to fill the window
+                // In normal mode, cap at 1.0x to avoid upscaling
+                let scale = if self.is_fullscreen {
+                    (avail.x / tex_size.x).min(avail.y / tex_size.y)
+                } else {
+                    (avail.x / tex_size.x).min(avail.y / tex_size.y).min(1.0)
+                };
                 let size = tex_size * scale;
 
                 ui.add(egui::Image::new(tex).fit_to_exact_size(size));
