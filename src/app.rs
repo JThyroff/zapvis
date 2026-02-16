@@ -222,7 +222,13 @@ impl eframe::App for ZapVisApp {
                 let avail = ui.available_size();
 
                 let tex_size = tex.size_vec2();
-                let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y).min(1.0);
+                // In fullscreen mode, allow scaling up to fill the window
+                // In normal mode, cap at 1.0x to avoid upscaling
+                let scale = if self.is_fullscreen {
+                    (avail.x / tex_size.x).min(avail.y / tex_size.y)
+                } else {
+                    (avail.x / tex_size.x).min(avail.y / tex_size.y).min(1.0)
+                };
                 let size = tex_size * scale;
 
                 ui.add(egui::Image::new(tex).fit_to_exact_size(size));
