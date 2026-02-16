@@ -161,9 +161,10 @@ impl eframe::App for ZapVisApp {
         // Process any decoded images from background threads
         let newly_loaded = self.cache.tick(ctx);
         
-        // If we have pending images, request a repaint to check for newly loaded images
+        // If the current image is pending, request a repaint to check for newly loaded images
+        // Use a small delay to avoid excessive repaints while still feeling responsive
         if self.cache.is_pending(self.seq.index) {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60 FPS
         }
 
         // Load initial cache once
