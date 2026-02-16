@@ -76,6 +76,7 @@ zapvis --config
 |-----|--------|
 | <kbd>←</kbd> or <kbd>A</kbd> | Previous frame |
 | <kbd>→</kbd> or <kbd>D</kbd> | Next frame |
+| <kbd>F</kbd> | Toggle fullscreen (maximize window) |
 | <kbd>Esc</kbd> | Quit |
 
 ## Configuration
