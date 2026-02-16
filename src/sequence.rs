@@ -138,13 +138,14 @@ pub fn pick_sequence(
                 index: idx,
             };
 
+            // Skip neigbor check for now
             // Neighbor evidence via stat(): cheap and avoids enumeration.
-            let has_next = spec.exists_with_ssh(idx + 1, request_tx.clone()).unwrap_or(false);
-            let has_prev = idx > 0 && spec.exists_with_ssh(idx - 1, request_tx.clone()).unwrap_or(false);
-
-            if has_next || has_prev {
-                return Ok((pat.clone(), spec));
-            }
+            //let has_next = spec.exists_with_ssh(idx + 1, request_tx.clone()).unwrap_or(false);
+            //let has_prev = idx > 0 && spec.exists_with_ssh(idx - 1, request_tx.clone()).unwrap_or(false);
+            
+            //if has_next || has_prev {
+            return Ok((pat.clone(), spec));
+            //}
         }
     }
 
