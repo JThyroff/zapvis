@@ -53,6 +53,7 @@ The focus is on predictable performance, minimal UI overhead, and fast sequentia
 - **Efficient caching**: Bidirectional preload with configurable radius to keep images ready
 - **Non-blocking UI**: Background image loading on separate threads; UI never stalls
 - **Persistent SSH**: Single SSH connection reused for all remote operations
+- **Step-size navigation**: Jump through sequences using power-of-ten increments (10⁰–10⁹) via number keys
 - **Configuration**: Patterns are auto-saved and reused
 
 ## Building
