@@ -10,7 +10,9 @@ It was developed to solve a practical problem: browsing large computer vision da
 
 ## Demo
 
-[![zapvis demo](https://raw.githubusercontent.com/JThyroff/zapvis/main/demo/thumbnail.png)]([https://github.com/USER/REPO/assets/123456/demo.mp4](https://youtu.be/Q-NTQ6y3z5I))
+<a href="https://youtu.be/Q-NTQ6y3z5I" target="_blank">
+  <img src="https://raw.githubusercontent.com/JThyroff/zapvis/main/demo/thumbnail.png" alt="zapvis demo">
+</a>
 
 
 ## Use Cases
