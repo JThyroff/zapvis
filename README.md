@@ -10,8 +10,8 @@ It was developed to solve a practical problem: browsing large computer vision da
 
 ## Demo
 
-<a href="https://youtu.be/Q-NTQ6y3z5I" target="_blank">
-  <img src="https://raw.githubusercontent.com/JThyroff/zapvis/main/demo/thumbnail.png" alt="zapvis demo">
+<a href="https://youtu.be/Q-NTQ6y3z5I">
+  <img src="https://raw.githubusercontent.com/JThyroff/zapvis/main/demo/thumbnail.png" alt="zapvis demo" width="400">
 </a>
 
 
