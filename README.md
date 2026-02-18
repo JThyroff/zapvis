@@ -32,6 +32,10 @@ The focus is on predictable performance, minimal UI overhead, and fast sequentia
 
 Requires Rust 1.70+.
 
+Install Rust and Cargo via rustup: https://rustup.rs
+
+On Linux, additional system libraries for windowing/OpenGL may be required.
+
 ```bash
 cargo build --release
 ```
@@ -84,6 +88,16 @@ zapvis --config
 |-----|--------|
 | <kbd>←</kbd> or <kbd>A</kbd> | Previous frame |
 | <kbd>→</kbd> or <kbd>D</kbd> | Next frame |
+| <kbd>0</kbd> | Set step size to 1 |
+| <kbd>1</kbd> | Set step size to 10 |
+| <kbd>2</kbd> | Set step size to 100 |
+| <kbd>3</kbd> | Set step size to 1,000 |
+| <kbd>4</kbd> | Set step size to 10,000 |
+| <kbd>5</kbd> | Set step size to 100,000 |
+| <kbd>6</kbd> | Set step size to 1,000,000 |
+| <kbd>7</kbd> | Set step size to 10,000,000 |
+| <kbd>8</kbd> | Set step size to 100,000,000 |
+| <kbd>9</kbd> | Set step size to 1,000,000,000 |
 | <kbd>F</kbd> | Toggle fullscreen (OS window maximization, keeps window decorations) |
 | <kbd>Esc</kbd> | Quit |
 
@@ -167,4 +181,4 @@ See `Cargo.toml` for full dependency list.
 
 ## License
 
-TBD
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
