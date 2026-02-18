@@ -4,12 +4,20 @@ A lightweight, keyboard-driven image sequence viewer with support for local and 
 
 ## Overview
 
-**zapvis** is designed for quickly browsing through sequences of numbered images using a single pattern. Instead of managing folders or playlists, you simply open any image file that matches a configured pattern—the viewer automatically detects the sequence and lets you navigate by frame.
+**zapvis** is a lightweight image sequence viewer designed for fast, keyboard-driven inspection of numbered image sequences, both locally and over SSH.
 
-Common use cases:
-- Reviewing rendered animation frames
-- Inspecting distributed training/testing results
-- Browsing remote video breakdowns or scene detection outputs
+It was developed to solve a practical problem: browsing large computer vision datasets stored on remote servers. Traditional SSH + X11 workflows and many image viewers perform poorly when directories contain tens of thousands of files, often blocking, lagging, or crashing due to directory enumeration. **zapvis** avoids this entirely by opening a single known frame and navigating the sequence purely by filename pattern, without listing directories.
+
+## Use Cases
+
+Common use cases include:
+
+* Screening large computer vision sequences stored on remote servers
+* Inspecting training, validation, or inference outputs without directory enumeration
+* Reviewing rendered animation or simulation frames
+* Browsing scene segmentation or video-to-image breakdowns at scale
+
+The focus is on predictable performance, minimal UI overhead, and fast sequential navigation rather than general image management.
 
 ## Features
 
