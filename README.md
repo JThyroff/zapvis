@@ -191,5 +191,4 @@ See `Cargo.toml` for full dependency list.
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
 
 ## Attribution
-YT Logo from:
-<a href="https://www.vecteezy.com/free-png/youtube-logo-instagram">Youtube Logo Instagram PNGs by Vecteezy</a>
+YT Logo from Vecteezy
