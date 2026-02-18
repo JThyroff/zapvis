@@ -8,6 +8,11 @@ A lightweight, keyboard-driven image sequence viewer with support for local and 
 
 It was developed to solve a practical problem: browsing large computer vision datasets stored on remote servers. Traditional SSH + X11 workflows and many image viewers perform poorly when directories contain tens of thousands of files, often blocking, lagging, or crashing due to directory enumeration. **zapvis** avoids this entirely by opening a single known frame and navigating the sequence purely by filename pattern, without listing directories.
 
+## Demo
+
+[![zapvis demo](https://raw.githubusercontent.com/JThyroff/zapvis/main/demo/thumbnail.png)]([https://github.com/USER/REPO/assets/123456/demo.mp4](https://youtu.be/Q-NTQ6y3z5I))
+
+
 ## Use Cases
 
 Common use cases include:
