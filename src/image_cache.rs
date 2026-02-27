@@ -111,6 +111,7 @@ impl ImageCache {
     }
 
     /// Process any decoded images from background loader thread (convert to textures)
+    /// Returns the number of images converted to textures
     fn process_decoded_images(&mut self, ctx: &egui::Context) -> usize {
         let mut converted = 0;
         // Process all available decoded images (non-blocking)
@@ -220,8 +221,9 @@ impl ImageCache {
     }
 
     /// Process any newly decoded images on each frame
-    pub fn tick(&mut self, ctx: &egui::Context) {
-        self.process_decoded_images(ctx);
+    /// Returns the number of images that were converted to textures
+    pub fn tick(&mut self, ctx: &egui::Context) -> usize {
+        self.process_decoded_images(ctx)
     }
 
     pub fn cache_info(&self) -> String {

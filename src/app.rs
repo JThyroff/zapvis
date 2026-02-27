@@ -159,10 +159,21 @@ impl ZapVisApp {
 impl eframe::App for ZapVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Process any decoded images from background threads
-        self.cache.tick(ctx);
+        let newly_loaded = self.cache.tick(ctx);
+        
+        // If the current image is pending, request a repaint to check for newly loaded images
+        // Use a small delay to avoid excessive repaints while still feeling responsive
+        if self.cache.is_pending(self.seq.index) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60 FPS
+        }
 
         // Load initial cache once
         if self.cache.is_empty() && self.status.is_empty() {
+            self.update_cache_and_status(ctx);
+        }
+        
+        // If the current image just became available, update status
+        if newly_loaded > 0 && self.cache.get(self.seq.index).is_some() {
             self.update_cache_and_status(ctx);
         }
 
