@@ -203,7 +203,7 @@ impl ImageCache {
 
                 if should_load {
                     self.pending_loads.insert(idx);
-                    let file_name = format!("{}{:0width$}{}", seq.prefix, idx, seq.suffix, width = seq.width);
+                    let file_name = seq.file_name_for(idx);
                     let req = LoadRequest {
                         idx,
                         file_name,
