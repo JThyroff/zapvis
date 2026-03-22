@@ -16,7 +16,10 @@ pub enum SequenceSource {
 pub struct SequenceSpec {
     pub source: SequenceSource,
     pub prefix: String,
+    /// Total width (sum of all group widths).
     pub width: usize,
+    /// Widths of individual `#` groups. Single entry for single-block patterns.
+    pub groups: Vec<usize>,
     pub suffix: String,
     pub index: u64,
 }
@@ -29,7 +32,21 @@ pub struct InputSpec {
 
 impl SequenceSpec {
     pub fn file_name_for(&self, idx: u64) -> String {
-        format!("{}{:0width$}{}", self.prefix, idx, self.suffix, width = self.width)
+        if self.groups.len() <= 1 {
+            format!("{}{:0width$}{}", self.prefix, idx, self.suffix, width = self.width)
+        } else {
+            // `{:0width$}` always produces at least `self.width` characters, and
+            // `self.width == groups.iter().sum()`, so the per-group byte slices are
+            // always in-bounds (all characters are ASCII digits).
+            let full = format!("{:0width$}", idx, width = self.width);
+            let mut parts: Vec<&str> = Vec::new();
+            let mut offset = 0;
+            for &g in &self.groups {
+                parts.push(&full[offset..offset + g]);
+                offset += g;
+            }
+            format!("{}{}{}", self.prefix, parts.join("_"), self.suffix)
+        }
     }
 
     pub fn path_display(&self, idx: u64) -> String {
@@ -65,30 +82,63 @@ impl SequenceSpec {
 
 /// Compile a pattern like "image_#####.png" into:
 /// - regex to extract index
-/// - prefix/width/suffix for reconstruction
+/// - prefix/groups/suffix for reconstruction
 ///
-/// MVP limitation: supports exactly ONE contiguous # group.
-pub fn compile_pattern(pat: &str) -> Result<(Regex, String, usize, String)> {
+/// Supports a single contiguous `#` group, or multiple `#` groups separated
+/// by `_` (the only supported inter-block delimiter).  All numeric parts are
+/// concatenated into a single index.
+pub fn compile_pattern(pat: &str) -> Result<(Regex, String, Vec<usize>, String)> {
     let hash_runs: Vec<(usize, usize)> = find_hash_runs(pat);
-    if hash_runs.len() != 1 {
+    if hash_runs.is_empty() {
         return Err(anyhow!(
-            "Pattern must contain exactly ONE contiguous # run (for now). Got: {pat}"
+            "Pattern must contain at least one # run. Got: {pat}"
         ));
     }
-    let (start, end) = hash_runs[0];
-    let prefix = &pat[..start];
-    let suffix = &pat[end..];
-    let width = end - start;
 
-    // Build regex: escape prefix/suffix, capture digits of exact width
-    let re_str = format!(
-        "^{}(\\d{{{}}}){}$",
-        regex::escape(prefix),
-        width,
-        regex::escape(suffix)
-    );
+    let prefix = &pat[..hash_runs[0].0];
+    let suffix = &pat[hash_runs.last().unwrap().1..];
+
+    // Collect per-group widths and validate that any separator between runs is '_'.
+    let mut groups: Vec<usize> = Vec::new();
+    for (i, &(start, end)) in hash_runs.iter().enumerate() {
+        groups.push(end - start);
+        if i + 1 < hash_runs.len() {
+            let between = &pat[end..hash_runs[i + 1].0];
+            if between != "_" {
+                return Err(anyhow!(
+                    "Multiple # blocks must be separated by '_'. Got separator: {:?} in {pat}",
+                    between
+                ));
+            }
+        }
+    }
+
+    // Build regex with one capture group per # block, separated by literal '_'.
+    let mut re_str = format!("^{}", regex::escape(prefix));
+    for (i, &w) in groups.iter().enumerate() {
+        if i > 0 {
+            re_str.push('_');
+        }
+        re_str.push_str(&format!("(\\d{{{}}})", w));
+    }
+    re_str.push_str(&format!("{}$", regex::escape(suffix)));
+
     let re = Regex::new(&re_str).context("Failed to compile regex from pattern")?;
-    Ok((re, prefix.to_string(), width, suffix.to_string()))
+    Ok((re, prefix.to_string(), groups, suffix.to_string()))
+}
+
+/// Concatenate the text of regex capture groups 1..=`n` into a single string.
+///
+/// This is used for multi-block `#` patterns where each block is a separate
+/// capture group, and the combined string is parsed as the sequence index.
+fn concat_captures(cap: &regex::Captures<'_>, n: usize) -> Result<String> {
+    (1..=n)
+        .map(|i| {
+            cap.get(i)
+                .map(|m| m.as_str())
+                .ok_or_else(|| anyhow!("Missing capture group {i}"))
+        })
+        .collect()
 }
 
 fn find_hash_runs(s: &str) -> Vec<(usize, usize)> {
@@ -125,15 +175,18 @@ pub fn pick_sequence(
     let source = input.source.clone();
 
     for pat in &cfg.patterns {
-        let (re, prefix, width, suffix) = compile_pattern(pat)?;
+        let (re, prefix, groups, suffix) = compile_pattern(pat)?;
         if let Some(cap) = re.captures(&file_name) {
-            let idx_str = cap.get(1).unwrap().as_str();
+            // Concatenate all capture groups to form the combined index string.
+            let idx_str = concat_captures(&cap, groups.len())?;
             let idx: u64 = idx_str.parse().context("Failed to parse captured index")?;
+            let width: usize = groups.iter().sum();
 
             let spec = SequenceSpec {
                 source: source.clone(),
                 prefix,
                 width,
+                groups,
                 suffix,
                 index: idx,
             };
@@ -180,4 +233,95 @@ pub fn file_name_from_str_path(path: &str) -> Result<String> {
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("Non-UTF8 filename not supported"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── compile_pattern ──────────────────────────────────────────────────────
+
+    #[test]
+    fn single_block_compile() {
+        let (re, prefix, groups, suffix) = compile_pattern("frame_######.png").unwrap();
+        assert_eq!(prefix, "frame_");
+        assert_eq!(groups, vec![6]);
+        assert_eq!(suffix, ".png");
+        assert!(re.is_match("frame_000042.png"));
+        assert!(!re.is_match("frame_42.png")); // too short
+    }
+
+    #[test]
+    fn multi_block_compile() {
+        let (re, prefix, groups, suffix) = compile_pattern("frame_######_#.png").unwrap();
+        assert_eq!(prefix, "frame_");
+        assert_eq!(groups, vec![6, 1]);
+        assert_eq!(suffix, ".png");
+        assert!(re.is_match("frame_000123_4.png"));
+        assert!(!re.is_match("frame_0001234.png")); // single block doesn't match
+    }
+
+    #[test]
+    fn invalid_separator_errors() {
+        assert!(compile_pattern("frame_####-#.png").is_err());
+    }
+
+    #[test]
+    fn no_hash_errors() {
+        assert!(compile_pattern("frame.png").is_err());
+    }
+
+    // ── index extraction ─────────────────────────────────────────────────────
+
+    #[test]
+    fn single_block_index_extraction() {
+        let (re, _, groups, _) = compile_pattern("frame_######.png").unwrap();
+        let cap = re.captures("frame_001234.png").unwrap();
+        let idx_str = concat_captures(&cap, groups.len()).unwrap();
+        assert_eq!(idx_str, "001234");
+        assert_eq!(idx_str.parse::<u64>().unwrap(), 1234);
+    }
+
+    #[test]
+    fn multi_block_index_extraction() {
+        let (re, _, groups, _) = compile_pattern("frame_######_#.png").unwrap();
+        let cap = re.captures("frame_000123_4.png").unwrap();
+        let idx_str = concat_captures(&cap, groups.len()).unwrap();
+        // Concatenated: "000123" + "4" = "0001234" → 1234
+        assert_eq!(idx_str, "0001234");
+        assert_eq!(idx_str.parse::<u64>().unwrap(), 1234);
+    }
+
+    // ── file_name_for ─────────────────────────────────────────────────────────
+
+    fn make_spec(prefix: &str, groups: Vec<usize>, suffix: &str, index: u64) -> SequenceSpec {
+        let width = groups.iter().sum();
+        SequenceSpec {
+            source: SequenceSource::Local(PathBuf::from(".")),
+            prefix: prefix.to_string(),
+            width,
+            groups,
+            suffix: suffix.to_string(),
+            index,
+        }
+    }
+
+    #[test]
+    fn single_block_file_name_for() {
+        let spec = make_spec("frame_", vec![6], ".png", 42);
+        assert_eq!(spec.file_name_for(42), "frame_000042.png");
+    }
+
+    #[test]
+    fn multi_block_file_name_for() {
+        let spec = make_spec("frame_", vec![6, 1], ".png", 1234);
+        // index 1234, total width 7 → "0001234", split [6,1] → "000123" + "4"
+        assert_eq!(spec.file_name_for(1234), "frame_000123_4.png");
+    }
+
+    #[test]
+    fn multi_block_file_name_for_zero() {
+        let spec = make_spec("frame_", vec![6, 1], ".png", 0);
+        assert_eq!(spec.file_name_for(0), "frame_000000_0.png");
+    }
 }
